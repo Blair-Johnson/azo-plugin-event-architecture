@@ -23,3 +23,6 @@ name = "azo-plugin-event-architecture"
 common = []
 default = ["src/event_architecture.py"]
 rlm = []
+
+[tool.agent-zoo.plugin.config]
+files = ["config/event_architecture.json"]

@@ -14,13 +14,19 @@ Subscriptions are strictly owned by the creating Agent Zoo session ID. Forked se
 pixi run azo-plugin install .
 ```
 
-The plugin is disabled by default, so installation alone exposes no tools or interrupt component. Enable it for a launch by adding:
+Installation creates an editable config at:
 
-```bash
-azo --config-set event_architecture.enabled=true
+```text
+~/.local/share/agent-zoo/plugin-configs/azo-plugin-event-architecture/config/event_architecture.json
 ```
 
-Use the same flag with your normal `azo` launch arguments. If you change a persistent config file for an already-running session, run `/reload` afterward.
+The installed template enables the plugin, so its tools appear in fresh sessions. Set `event_architecture.enabled` to `false` in that file to disable it, then run `/reload` for an already-running session. Existing user edits are preserved on reinstall unless `azo-plugin install --force-config` is used.
+
+A launch-time override still has highest precedence when needed:
+
+```bash
+azo --config-set event_architecture.enabled=false
+```
 
 Forks created through `fork_agent` inherit this launch-time enablement through a plugin-private environment marker containing the exact parent session ID. A matching child rotates the marker to its own ID for descendants. This compensates for the current `/fork` launcher not forwarding transient `--config-set` arguments, while unrelated lineages and root sessions remain disabled.
 

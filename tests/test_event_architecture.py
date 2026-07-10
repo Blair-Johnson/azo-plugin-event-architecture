@@ -26,7 +26,11 @@ def load_plugin():
 
 
 @pytest.fixture
-def plugin():
+def plugin(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "AZO_EVENT_ARCHITECTURE_CONFIG",
+        str(tmp_path / "missing-event-architecture.json"),
+    )
     return load_plugin()
 
 
@@ -544,6 +548,60 @@ def test_register_features_is_disabled_by_default(plugin, monkeypatch):
 
     assert builder.features == []
     assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
+
+
+def test_installed_config_enables_tools_in_fresh_session(plugin, monkeypatch, tmp_path):
+    config_path = tmp_path / "event_architecture.json"
+    config_path.write_text(
+        '{"event_architecture": {"enabled": true}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(plugin.CONFIG_PATH_ENV, str(config_path))
+    builder = Builder()
+
+    plugin.register_features(
+        builder,
+        session=registration_session("root-session"),
+        config={},
+    )
+
+    assert [feature.name for feature in builder.features] == ["event_architecture"]
+
+
+def test_installed_config_can_disable_tools(plugin, monkeypatch, tmp_path):
+    config_path = tmp_path / "event_architecture.json"
+    config_path.write_text(
+        '{"event_architecture": {"enabled": false}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(plugin.CONFIG_PATH_ENV, str(config_path))
+    builder = Builder()
+
+    plugin.register_features(
+        builder,
+        session=registration_session("root-session"),
+        config={},
+    )
+
+    assert builder.features == []
+
+
+def test_explicit_config_overrides_installed_config(plugin, monkeypatch, tmp_path):
+    config_path = tmp_path / "event_architecture.json"
+    config_path.write_text(
+        '{"event_architecture": {"enabled": true}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(plugin.CONFIG_PATH_ENV, str(config_path))
+    builder = Builder()
+
+    plugin.register_features(
+        builder,
+        session=registration_session("root-session"),
+        config={"event_architecture": {"enabled": False}},
+    )
+
+    assert builder.features == []
 
 
 def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):

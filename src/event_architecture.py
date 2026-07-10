@@ -24,6 +24,9 @@ STATE_ATTR = "azo_event_subscriptions"
 REACTOR_STATE_ATTR = "azo_event_reactor_runtime"
 SUSPEND_CONFIRM_ATTR = "azo_event_suspend_confirmation_pending"
 FORK_ENABLE_ENV = "AZO_EVENT_ARCHITECTURE_FORK_ENABLED"
+CONFIG_PATH_ENV = "AZO_EVENT_ARCHITECTURE_CONFIG"
+PLUGIN_NAME = "azo-plugin-event-architecture"
+CONFIG_FILENAME = "event_architecture.json"
 PERSISTENT_FORK_MARKER = "<azo-event-architecture fork-lifecycle=\"persistent\">"
 EPHEMERAL_FORK_MARKER = "<azo-event-architecture fork-lifecycle=\"ephemeral\">"
 PERSISTENT_FORK_GUIDANCE = (
@@ -1022,6 +1025,39 @@ def remove_interrupt_subscription(subscription: str, state=None) -> str:
     _REACTOR.sync(session_id, _owned_subscriptions(state)[1])
     return f"Removed subscription {spec.get('name')} ({subscription_id}) from session {session_id}."
 
+
+def _agent_zoo_state_root() -> Path:
+    for env_name in ("AGENT_ZOO_HOME", "AGENT_ZOO_STATE_ROOT", "AGENT_ZOO_INSTALL_ROOT"):
+        value = str(os.environ.get(env_name, "") or "").strip()
+        if value:
+            return Path(value).expanduser()
+    xdg_data = str(os.environ.get("XDG_DATA_HOME", "") or "").strip()
+    base = Path(xdg_data).expanduser() if xdg_data else Path.home() / ".local" / "share"
+    return base / "agent-zoo"
+
+
+def _plugin_config_path() -> Path:
+    override = str(os.environ.get(CONFIG_PATH_ENV, "") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return (
+        _agent_zoo_state_root()
+        / "plugin-configs"
+        / PLUGIN_NAME
+        / "config"
+        / CONFIG_FILENAME
+    )
+
+
+def _load_installed_config() -> dict[str, Any]:
+    path = _plugin_config_path()
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _configured_enablement(config: Any) -> bool | None:
     section = (config or {}).get("event_architecture")
     if not isinstance(section, dict) or "enabled" not in section:
@@ -1036,13 +1072,20 @@ def _configured_enablement(config: Any) -> bool | None:
     return value is True
 
 
+def _effective_configured_enablement(config: Any) -> bool | None:
+    explicit = _configured_enablement(config)
+    if explicit is not None:
+        return explicit
+    return _configured_enablement(_load_installed_config())
+
+
 def _registration_session_id(session: Any) -> str:
     state = getattr(session, "state", None)
     return _current_session_id(state) if state is not None else ""
 
 
 def _plugin_enabled(config: Any, session: Any) -> bool:
-    configured = _configured_enablement(config)
+    configured = _effective_configured_enablement(config)
     if configured is not None:
         return configured
     state = getattr(session, "state", None)
@@ -1058,7 +1101,7 @@ def _plugin_enabled(config: Any, session: Any) -> bool:
 
 def register_features(builder, *, session, config):
     """Register model tools only when explicitly enabled or inherited by a fork."""
-    configured = _configured_enablement(config)
+    configured = _effective_configured_enablement(config)
     enabled = _plugin_enabled(config, session)
     state = getattr(session, "state", None)
     is_fork_session = (
