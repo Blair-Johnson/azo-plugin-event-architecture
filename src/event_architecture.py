@@ -15,18 +15,34 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from agent_utils import Feature, tool
+from agent_utils import Feature, Tool, tool
 from agent_utils.components import InterruptCheck
 from agent_utils.session_cwd import get_session_cwd
 
 
 STATE_ATTR = "azo_event_subscriptions"
 REACTOR_STATE_ATTR = "azo_event_reactor_runtime"
+SUSPEND_CONFIRM_ATTR = "azo_event_suspend_confirmation_pending"
 FORK_ENABLE_ENV = "AZO_EVENT_ARCHITECTURE_FORK_ENABLED"
+PERSISTENT_FORK_MARKER = "<azo-event-architecture fork-lifecycle=\"persistent\">"
+EPHEMERAL_FORK_MARKER = "<azo-event-architecture fork-lifecycle=\"ephemeral\">"
+PERSISTENT_FORK_GUIDANCE = (
+    "This is a persistent, long-running fork. Remain available for future work and "
+    "handle tasks as they arrive; use RLMs for bounded sub-tasks as useful."
+)
+EPHEMERAL_FORK_GUIDANCE = (
+    "This is an ephemeral, single-task fork. Complete the assigned work, use RLMs "
+    "for bounded sub-tasks as useful, then call suspend_session() twice as directed."
+)
 MIN_INTERVAL_SECONDS = 1.0
 MAX_CONCURRENT_COMMANDS = 4
 DEFAULT_OUTPUT_LIMIT_BYTES = 16_384
 VALID_TRIGGERS = {"rising", "change", "each"}
+VALID_FORK_LIFECYCLES = {"persistent", "ephemeral"}
+SUSPEND_CONFIRMATION_MESSAGE = (
+    "You have requested to suspend this session, have you completed all work "
+    "originally allocated to this fork? Call suspend_session() again to confirm."
+)
 
 
 class CommandObservation:
@@ -723,30 +739,146 @@ class CommandWatchCheck(InterruptCheck):
         return f"  command watches: {enabled} enabled for session {session_id or '(unbound)'}"
 
 
+def _fork_launch_message(text: str, lifecycle: str) -> str:
+    if lifecycle == "ephemeral":
+        marker = EPHEMERAL_FORK_MARKER
+        guidance = EPHEMERAL_FORK_GUIDANCE
+    else:
+        marker = PERSISTENT_FORK_MARKER
+        guidance = PERSISTENT_FORK_GUIDANCE
+    return f"{marker}\n{guidance}\n\n{text}"
+
+
+def _content_texts(content: Any) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict)
+        ]
+    return []
+
+
+def _latest_fork_lifecycle(state: Any) -> str:
+    lifecycle = ""
+    for entry in getattr(state, "entries", []) or []:
+        for message in getattr(entry, "messages", []) or []:
+            if str(message.get("role") or "") != "user":
+                continue
+            for text in _content_texts(message.get("content")):
+                persistent_at = text.rfind(PERSISTENT_FORK_MARKER)
+                ephemeral_at = text.rfind(EPHEMERAL_FORK_MARKER)
+                if persistent_at >= 0 or ephemeral_at >= 0:
+                    lifecycle = (
+                        "ephemeral"
+                        if ephemeral_at > persistent_at
+                        else "persistent"
+                    )
+    return lifecycle
+
+
+def _ephemeral_fork_authorized(state: Any) -> bool:
+    session_kind = str(getattr(state, "_session_kind", "") or "").strip().lower()
+    return session_kind == "fork" and _latest_fork_lifecycle(state) == "ephemeral"
+
+
 @tool(optional_reads={"session_io", "run_db", "_session_id"})
-def fork_agent(message: str, state=None) -> str:
-    """Fork this live session into a persistent collaborating agent.
+def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
+    """Fork this live session into a persistent or ephemeral collaborating agent.
+
+    Persistent forks remain available for future work and do not receive a
+    self-suspension tool. Ephemeral forks receive ``suspend_session`` and should
+    use it after completing their single assigned task.
 
     Args:
         message: Initial instructions supplied to the forked agent.
+        lifecycle: ``persistent`` for a long-running collaborator or ``ephemeral``
+            for a single-task fork that may suspend itself when finished.
     """
     text = str(message or "").strip()
     if not text:
         raise ValueError("message must not be empty")
+    normalized_lifecycle = str(lifecycle or "").strip().lower()
+    if normalized_lifecycle not in VALID_FORK_LIFECYCLES:
+        raise ValueError("lifecycle must be 'persistent' or 'ephemeral'")
     session_io = getattr(state, "session_io", None)
     if session_io is None or not callable(getattr(session_io, "send", None)):
         raise RuntimeError("fork_agent requires a live Agent Zoo session")
+    session_id = _current_session_id(state)
+    if not session_id:
+        raise RuntimeError("fork_agent requires a bound live session ID")
+
     session_io.send(
         "slash_command",
-        {"raw": f"/fork {text}"},
+        {"raw": f"/fork {_fork_launch_message(text, normalized_lifecycle)}"},
         client_id="azo-plugin-event-architecture",
     )
-    session_id = _current_session_id(state)
     return (
         "Fork requested through the live session control path. "
-        f"Parent session: {session_id or '(unknown)'}. "
-        "The new persistent agent will receive the supplied message."
+        f"Lifecycle: {normalized_lifecycle}. Parent session: {session_id}. "
+        "The new agent will receive the supplied message."
     )
+
+
+class SuspendSession(Tool):
+    """Ephemeral-fork-only graceful suspension tool."""
+
+    optional_reads = {"entries", "last_tool_calls", SUSPEND_CONFIRM_ATTR}
+    writes = {
+        SUSPEND_CONFIRM_ATTR,
+        "done",
+        "shutdown_reason",
+        "shutdown_save",
+        "shutdown_registry_status",
+        "shutdown_spawned_policy",
+        "shutdown",
+    }
+    init = {SUSPEND_CONFIRM_ATTR: bool}
+
+    @staticmethod
+    def fn(state=None) -> str:
+        """Suspend this ephemeral fork after a required two-call confirmation."""
+        previous_calls = list(getattr(state, "last_tool_calls", []) or [])
+        previous_was_confirmation = (
+            len(previous_calls) == 1
+            and previous_calls[0].name == "suspend_session"
+            and previous_calls[0].result == SUSPEND_CONFIRMATION_MESSAGE
+            and not bool(previous_calls[0].error)
+        )
+        current_calls = []
+        entries = list(getattr(state, "entries", []) or [])
+        if entries:
+            current_calls = list(getattr(entries[-1], "tool_calls", []) or [])
+        if not current_calls:
+            current_calls = list(getattr(state, "pending_tool_calls", []) or [])
+        current_is_only_suspend = (
+            len(current_calls) == 1 and current_calls[0].name == "suspend_session"
+        )
+        confirmation_pending = bool(getattr(state, SUSPEND_CONFIRM_ATTR, False))
+        if (
+            not confirmation_pending
+            or not previous_was_confirmation
+            or not current_is_only_suspend
+        ):
+            setattr(state, SUSPEND_CONFIRM_ATTR, True)
+            return SUSPEND_CONFIRMATION_MESSAGE
+
+        setattr(state, SUSPEND_CONFIRM_ATTR, False)
+        state.done = True
+        state.shutdown_reason = "suspend"
+        state.shutdown_save = True
+        state.shutdown_registry_status = "stopped"
+        state.shutdown_spawned_policy = "leave"
+        state.shutdown = True
+        return "Ephemeral fork suspension confirmed; saving and suspending this session."
+
+    def available(self, state) -> bool:
+        return _ephemeral_fork_authorized(state)
+
+
+suspend_session = SuspendSession()
 
 
 @tool(optional_reads={STATE_ATTR, "run_db", "_session_id", "session_io"}, writes={STATE_ATTR})
@@ -928,6 +1060,10 @@ def register_features(builder, *, session, config):
     """Register model tools only when explicitly enabled or inherited by a fork."""
     configured = _configured_enablement(config)
     enabled = _plugin_enabled(config, session)
+    state = getattr(session, "state", None)
+    is_fork_session = (
+        str(getattr(state, "_session_kind", "") or "").strip().lower() == "fork"
+    )
     current_session_id = _registration_session_id(session)
     if enabled and current_session_id:
         os.environ[FORK_ENABLE_ENV] = current_session_id
@@ -936,15 +1072,19 @@ def register_features(builder, *, session, config):
     if not enabled:
         _REACTOR.cleanup()
         return
+
+    components = [
+        fork_agent,
+        subscribe_interrupt,
+        list_interrupt_subscriptions,
+        remove_interrupt_subscription,
+        CommandWatchCheck(_REACTOR),
+    ]
+    if is_fork_session:
+        components.insert(1, suspend_session)
     builder.add(
         Feature(
             name="event_architecture",
-            components=[
-                fork_agent,
-                subscribe_interrupt,
-                list_interrupt_subscriptions,
-                remove_interrupt_subscription,
-                CommandWatchCheck(_REACTOR),
-            ],
+            components=components,
         )
     )

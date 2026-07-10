@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils import State, ToolCall
+from agent_utils import Entry, State, ToolCall
 
 
 PLUGIN_PATH = Path(__file__).parents[1] / "src" / "event_architecture.py"
@@ -53,6 +53,22 @@ def make_state(session_id: str = "session-a") -> State:
     return state
 
 
+def authorize_ephemeral_fork(plugin, state: State) -> None:
+    state._session_kind = "fork"
+    state.entries.append(
+        Entry(
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"{plugin.EPHEMERAL_FORK_MARKER}\nassigned work",
+                }
+            ],
+            index=len(state.entries),
+            step=state.step,
+        )
+    )
+
+
 def call_tool(tool, state: State, **kwargs):
     tc = ToolCall(
         id="call-1",
@@ -72,13 +88,176 @@ def test_fork_agent_routes_existing_slash_command(plugin):
 
     assert tc.error is False
     assert "Fork requested" in tc.result
-    assert state.session_io.sent == [
-        (
-            "slash_command",
-            {"raw": "/fork Monitor issues independently."},
-            "azo-plugin-event-architecture",
+    assert len(state.session_io.sent) == 1
+    channel, payload, client_id = state.session_io.sent[0]
+    assert channel == "slash_command"
+    assert client_id == "azo-plugin-event-architecture"
+    assert payload["raw"].startswith(f"/fork {plugin.PERSISTENT_FORK_MARKER}\n")
+    assert payload["raw"].endswith("\n\nMonitor issues independently.")
+
+
+def test_fork_agent_defaults_to_persistent_lifecycle(plugin):
+    state = make_state("parent-session")
+
+    tc = call_tool(plugin.fork_agent, state, message="Remain available for work.")
+
+    assert tc.error is False
+    raw = state.session_io.sent[0][1]["raw"]
+    assert raw.startswith(f"/fork {plugin.PERSISTENT_FORK_MARKER}\n")
+    assert plugin.PERSISTENT_FORK_GUIDANCE in raw
+    assert plugin.EPHEMERAL_FORK_MARKER not in raw
+    assert raw.endswith("\n\nRemain available for work.")
+
+
+def test_fork_agent_propagates_ephemeral_lifecycle(plugin):
+    state = make_state("parent-session")
+
+    tc = call_tool(
+        plugin.fork_agent,
+        state,
+        message="Handle one issue and stop.",
+        lifecycle="ephemeral",
+    )
+
+    assert tc.error is False
+    assert "Lifecycle: ephemeral" in (tc.result or "")
+    raw = state.session_io.sent[0][1]["raw"]
+    assert raw.startswith(f"/fork {plugin.EPHEMERAL_FORK_MARKER}\n")
+    assert plugin.EPHEMERAL_FORK_GUIDANCE in raw
+    assert raw.endswith("\n\nHandle one issue and stop.")
+
+
+def test_fork_agent_rejects_unknown_lifecycle(plugin):
+    state = make_state("parent-session")
+
+    tc = call_tool(
+        plugin.fork_agent,
+        state,
+        message="Do work.",
+        lifecycle="temporary",
+    )
+
+    assert tc.error is True
+    assert "persistent" in (tc.result or "")
+    assert "ephemeral" in (tc.result or "")
+    assert state.session_io.sent == []
+
+
+
+
+def test_latest_fork_lifecycle_overrides_cloned_ancestor(plugin):
+    state = make_state("persistent-descendant")
+    authorize_ephemeral_fork(plugin, state)
+    state.entries.append(
+        Entry(
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"{plugin.PERSISTENT_FORK_MARKER}\nnew role",
+                }
+            ],
+            index=len(state.entries),
+            step=state.step,
+        )
+    )
+
+    assert plugin._latest_fork_lifecycle(state) == "persistent"
+    assert plugin.suspend_session.available(state) is False
+
+
+def test_suspend_session_is_unavailable_to_persistent_fork(plugin):
+    state = make_state("persistent-child")
+    state._session_kind = "fork"
+    state.last_tool_calls = []
+
+    tc = call_tool(plugin.suspend_session, state)
+
+    assert tc.error is True
+    assert "not currently available" in (tc.result or "")
+    assert not hasattr(state, plugin.SUSPEND_CONFIRM_ATTR)
+    assert state.done is False
+
+
+def test_suspend_session_requires_adjacent_confirmation(plugin):
+    state = make_state("ephemeral-child")
+    authorize_ephemeral_fork(plugin, state)
+    state.last_tool_calls = []
+
+    first = call_tool(plugin.suspend_session, state)
+
+    assert first.error is False
+    assert first.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
+    assert state.azo_event_suspend_confirmation_pending is True
+    assert state.done is False
+
+    state.last_tool_calls = [first]
+    second = call_tool(plugin.suspend_session, state)
+
+    assert second.error is False
+    assert "suspension confirmed" in (second.result or "")
+    assert state.azo_event_suspend_confirmation_pending is False
+    assert state.done is True
+    assert state.shutdown is True
+    assert state.shutdown_reason == "suspend"
+    assert state.shutdown_save is True
+    assert state.shutdown_registry_status == "stopped"
+    assert state.shutdown_spawned_policy == "leave"
+
+
+def test_suspend_session_confirmation_resets_after_other_tool(plugin):
+    state = make_state("ephemeral-child")
+    authorize_ephemeral_fork(plugin, state)
+    state.last_tool_calls = []
+    first = call_tool(plugin.suspend_session, state)
+    state.last_tool_calls = [
+        ToolCall(
+            id="other-call",
+            name="list_tools",
+            raw_args="{}",
+            parsed_args={},
+            result="ok",
         )
     ]
+
+    retry = call_tool(plugin.suspend_session, state)
+
+    assert first.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
+    assert retry.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
+    assert state.azo_event_suspend_confirmation_pending is True
+    assert state.done is False
+
+
+def test_suspend_session_rejects_confirmation_bundled_with_other_tool(plugin):
+    state = make_state("ephemeral-child")
+    authorize_ephemeral_fork(plugin, state)
+    state.last_tool_calls = []
+    first = call_tool(plugin.suspend_session, state)
+    state.last_tool_calls = [first]
+    state.entries = [
+        *state.entries,
+        SimpleNamespace(
+            tool_calls=[
+                ToolCall(
+                    id="confirm-call",
+                    name="suspend_session",
+                    raw_args="{}",
+                    parsed_args={},
+                ),
+                ToolCall(
+                    id="other-call",
+                    name="list_tools",
+                    raw_args="{}",
+                    parsed_args={},
+                ),
+            ]
+        )
+    ]
+
+    retry = call_tool(plugin.suspend_session, state)
+
+    assert retry.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
+    assert state.azo_event_suspend_confirmation_pending is True
+    assert state.done is False
 
 
 def test_owned_subscriptions_are_session_local_and_non_destructive(plugin):
@@ -310,8 +489,6 @@ def test_execute_command_timeout_kills_process_group(plugin, tmp_path):
     assert observation.returncode is not None
 
 
-
-
 def test_execute_command_kills_background_descendant_after_shell_exit(plugin, tmp_path):
     launched = {}
     observation = plugin._execute_command(
@@ -389,6 +566,67 @@ def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
         "remove_interrupt_subscription",
     }.issubset(tool_names)
     assert any(isinstance(component, plugin.CommandWatchCheck) for component in components)
+
+
+def test_ephemeral_fork_registration_adds_suspend_tool(plugin, monkeypatch):
+    builder = Builder()
+    monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent-session")
+    session = registration_session(
+        "child-session",
+        kind="fork",
+        parent_session_id="parent-session",
+    )
+    authorize_ephemeral_fork(plugin, session.state)
+
+    plugin.register_features(builder, session=session, config={})
+
+    components = builder.features[0].components
+    tool_names = {
+        component.name for component in components if hasattr(component, "name")
+    }
+    assert "suspend_session" in tool_names
+    assert plugin.suspend_session.available(session.state) is True
+    plugin.suspend_session(session.state)
+    assert session.state.tool_schemas["suspend_session"]["available"] is True
+
+
+def test_persistent_fork_registration_gates_suspend_tool(plugin, monkeypatch):
+    builder = Builder()
+    monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent-session")
+    session = registration_session(
+        "child-session",
+        kind="fork",
+        parent_session_id="parent-session",
+    )
+
+    plugin.register_features(builder, session=session, config={})
+
+    components = builder.features[0].components
+    tool_names = {
+        component.name for component in components if hasattr(component, "name")
+    }
+    assert "suspend_session" in tool_names
+    assert plugin.suspend_session.available(session.state) is False
+    plugin.suspend_session(session.state)
+    assert session.state.tool_schemas["suspend_session"]["available"] is False
+
+
+def test_nonfork_registration_excludes_suspend_tool(plugin, monkeypatch):
+    builder = Builder()
+    monkeypatch.delenv(plugin.FORK_ENABLE_ENV, raising=False)
+    session = registration_session("root-session")
+
+    plugin.register_features(
+        builder,
+        session=session,
+        config={"event_architecture": {"enabled": True}},
+    )
+
+    components = builder.features[0].components
+    tool_names = {
+        component.name for component in components if hasattr(component, "name")
+    }
+    assert "suspend_session" not in tool_names
 
 
 def test_fork_session_inherits_and_rotates_launch_enablement(plugin, monkeypatch):
