@@ -1103,10 +1103,6 @@ def register_features(builder, *, session, config):
     """Register model tools only when explicitly enabled or inherited by a fork."""
     configured = _effective_configured_enablement(config)
     enabled = _plugin_enabled(config, session)
-    state = getattr(session, "state", None)
-    is_fork_session = (
-        str(getattr(state, "_session_kind", "") or "").strip().lower() == "fork"
-    )
     current_session_id = _registration_session_id(session)
     if enabled and current_session_id:
         os.environ[FORK_ENABLE_ENV] = current_session_id
@@ -1118,13 +1114,12 @@ def register_features(builder, *, session, config):
 
     components = [
         fork_agent,
+        suspend_session,
         subscribe_interrupt,
         list_interrupt_subscriptions,
         remove_interrupt_subscription,
         CommandWatchCheck(_REACTOR),
     ]
-    if is_fork_session:
-        components.insert(1, suspend_session)
     builder.add(
         Feature(
             name="event_architecture",

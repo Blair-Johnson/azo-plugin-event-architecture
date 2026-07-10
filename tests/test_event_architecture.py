@@ -669,7 +669,7 @@ def test_persistent_fork_registration_gates_suspend_tool(plugin, monkeypatch):
     assert session.state.tool_schemas["suspend_session"]["available"] is False
 
 
-def test_nonfork_registration_excludes_suspend_tool(plugin, monkeypatch):
+def test_nonfork_registration_gates_suspend_tool(plugin, monkeypatch):
     builder = Builder()
     monkeypatch.delenv(plugin.FORK_ENABLE_ENV, raising=False)
     session = registration_session("root-session")
@@ -684,7 +684,32 @@ def test_nonfork_registration_excludes_suspend_tool(plugin, monkeypatch):
     tool_names = {
         component.name for component in components if hasattr(component, "name")
     }
-    assert "suspend_session" not in tool_names
+    assert "suspend_session" in tool_names
+    assert plugin.suspend_session.available(session.state) is False
+    plugin.suspend_session(session.state)
+    assert session.state.tool_schemas["suspend_session"]["available"] is False
+
+
+def test_suspend_tool_becomes_available_after_fork_state_is_restored(plugin, monkeypatch):
+    builder = Builder()
+    monkeypatch.delenv(plugin.FORK_ENABLE_ENV, raising=False)
+    session = registration_session("child-session")
+
+    plugin.register_features(
+        builder,
+        session=session,
+        config={"event_architecture": {"enabled": True}},
+    )
+
+    assert plugin.suspend_session in builder.features[0].components
+    assert plugin.suspend_session.available(session.state) is False
+
+    session.state._session_kind = "fork"
+    authorize_ephemeral_fork(plugin, session.state)
+    plugin.suspend_session(session.state)
+
+    assert plugin.suspend_session.available(session.state) is True
+    assert session.state.tool_schemas["suspend_session"]["available"] is True
 
 
 def test_fork_session_inherits_and_rotates_launch_enablement(plugin, monkeypatch):
