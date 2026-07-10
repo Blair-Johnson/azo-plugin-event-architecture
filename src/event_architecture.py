@@ -783,8 +783,7 @@ def _latest_fork_lifecycle(state: Any) -> str:
 
 
 def _ephemeral_fork_authorized(state: Any) -> bool:
-    session_kind = str(getattr(state, "_session_kind", "") or "").strip().lower()
-    return session_kind == "fork" and _latest_fork_lifecycle(state) == "ephemeral"
+    return _latest_fork_lifecycle(state) == "ephemeral"
 
 
 @tool(optional_reads={"session_io", "run_db", "_session_id"})
@@ -828,7 +827,7 @@ def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
 class SuspendSession(Tool):
     """Ephemeral-fork-only graceful suspension tool."""
 
-    optional_reads = {"entries", "last_tool_calls", SUSPEND_CONFIRM_ATTR}
+    optional_reads = {"entries", "last_tool_calls", "session_io", SUSPEND_CONFIRM_ATTR}
     writes = {
         SUSPEND_CONFIRM_ATTR,
         "done",
@@ -869,6 +868,14 @@ class SuspendSession(Tool):
             return SUSPEND_CONFIRMATION_MESSAGE
 
         setattr(state, SUSPEND_CONFIRM_ATTR, False)
+        session_io = getattr(state, "session_io", None)
+        if session_io is None or not callable(getattr(session_io, "send", None)):
+            raise RuntimeError("suspend_session requires a live Agent Zoo session")
+        session_io.send(
+            "control",
+            {"type": "suspend", "reason": "ephemeral fork completed"},
+            client_id="azo-plugin-event-architecture",
+        )
         state.done = True
         state.shutdown_reason = "suspend"
         state.shutdown_save = True

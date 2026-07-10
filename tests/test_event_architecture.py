@@ -193,6 +193,7 @@ def test_suspend_session_requires_adjacent_confirmation(plugin):
     assert first.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
     assert state.azo_event_suspend_confirmation_pending is True
     assert state.done is False
+    assert state.session_io.sent == []
 
     state.last_tool_calls = [first]
     second = call_tool(plugin.suspend_session, state)
@@ -206,6 +207,13 @@ def test_suspend_session_requires_adjacent_confirmation(plugin):
     assert state.shutdown_save is True
     assert state.shutdown_registry_status == "stopped"
     assert state.shutdown_spawned_policy == "leave"
+    assert state.session_io.sent == [
+        (
+            "control",
+            {"type": "suspend", "reason": "ephemeral fork completed"},
+            "azo-plugin-event-architecture",
+        )
+    ]
 
 
 def test_suspend_session_confirmation_resets_after_other_tool(plugin):
@@ -704,7 +712,6 @@ def test_suspend_tool_becomes_available_after_fork_state_is_restored(plugin, mon
     assert plugin.suspend_session in builder.features[0].components
     assert plugin.suspend_session.available(session.state) is False
 
-    session.state._session_kind = "fork"
     authorize_ephemeral_fork(plugin, session.state)
     plugin.suspend_session(session.state)
 
