@@ -788,16 +788,18 @@ def _ephemeral_fork_authorized(state: Any) -> bool:
 
 @tool(optional_reads={"session_io", "run_db", "_session_id"})
 def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
-    """Fork this live session into a persistent or ephemeral collaborating agent.
+    """Create an independent worker agent that can respond to future events.
 
-    Persistent forks remain available for future work and do not receive a
-    self-suspension tool. Ephemeral forks receive ``suspend_session`` and should
-    use it after completing their single assigned task.
+    Forks cannot be messaged by the calling agent and do not return task results
+    or output buffers to it. Use this tool to construct autonomous, event-driven
+    workflows. Use ``submit_rlm`` instead for delegated work that should return a
+    result or output buffer.
 
     Args:
-        message: Initial instructions supplied to the forked agent.
-        lifecycle: ``persistent`` for a long-running collaborator or ``ephemeral``
-            for a single-task fork that may suspend itself when finished.
+        message: Initial instructions supplied to the independent worker.
+        lifecycle: ``persistent`` creates a long-running worker that remains
+            available for future events. ``ephemeral`` creates an independent
+            worker for a bounded task that may suspend itself when finished.
     """
     text = str(message or "").strip()
     if not text:
