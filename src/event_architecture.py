@@ -797,9 +797,7 @@ def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
 
     Args:
         message: Initial instructions supplied to the independent worker.
-        lifecycle: ``persistent`` creates a long-running worker that remains
-            available for future events. ``ephemeral`` creates an independent
-            worker for a bounded task that may suspend itself when finished.
+        lifecycle: ``persistent`` creates a long-running worker that remains available for future events; ``ephemeral`` creates an independent worker for a bounded task that may suspend itself when finished.
     """
     text = str(message or "").strip()
     if not text:
