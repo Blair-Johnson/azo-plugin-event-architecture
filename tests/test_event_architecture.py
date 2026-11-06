@@ -554,7 +554,7 @@ def test_register_features_is_disabled_by_default(plugin, monkeypatch):
         config={},
     )
 
-    assert builder.features == []
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
     assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
 
 
@@ -573,7 +573,7 @@ def test_installed_config_enables_tools_in_fresh_session(plugin, monkeypatch, tm
         config={},
     )
 
-    assert [feature.name for feature in builder.features] == ["event_architecture"]
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
 
 
 def test_installed_config_can_disable_tools(plugin, monkeypatch, tmp_path):
@@ -591,7 +591,7 @@ def test_installed_config_can_disable_tools(plugin, monkeypatch, tmp_path):
         config={},
     )
 
-    assert builder.features == []
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
 
 
 def test_explicit_config_overrides_installed_config(plugin, monkeypatch, tmp_path):
@@ -609,7 +609,7 @@ def test_explicit_config_overrides_installed_config(plugin, monkeypatch, tmp_pat
         config={"event_architecture": {"enabled": False}},
     )
 
-    assert builder.features == []
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
 
 
 def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
@@ -622,8 +622,8 @@ def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
     )
 
     assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "root-session"
-    assert [feature.name for feature in builder.features] == ["event_architecture"]
-    components = builder.features[0].components
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
+    components = builder.features[1].components
     tool_names = {component.name for component in components if hasattr(component, "name")}
     assert {
         "fork_agent",
@@ -646,7 +646,7 @@ def test_ephemeral_fork_registration_adds_suspend_tool(plugin, monkeypatch):
 
     plugin.register_features(builder, session=session, config={})
 
-    components = builder.features[0].components
+    components = builder.features[1].components
     tool_names = {
         component.name for component in components if hasattr(component, "name")
     }
@@ -667,7 +667,7 @@ def test_persistent_fork_registration_gates_suspend_tool(plugin, monkeypatch):
 
     plugin.register_features(builder, session=session, config={})
 
-    components = builder.features[0].components
+    components = builder.features[1].components
     tool_names = {
         component.name for component in components if hasattr(component, "name")
     }
@@ -688,7 +688,7 @@ def test_nonfork_registration_gates_suspend_tool(plugin, monkeypatch):
         config={"event_architecture": {"enabled": True}},
     )
 
-    components = builder.features[0].components
+    components = builder.features[1].components
     tool_names = {
         component.name for component in components if hasattr(component, "name")
     }
@@ -709,7 +709,7 @@ def test_suspend_tool_becomes_available_after_fork_state_is_restored(plugin, mon
         config={"event_architecture": {"enabled": True}},
     )
 
-    assert plugin.suspend_session in builder.features[0].components
+    assert plugin.suspend_session in builder.features[1].components
     assert plugin.suspend_session.available(session.state) is False
 
     authorize_ephemeral_fork(plugin, session.state)
@@ -730,7 +730,7 @@ def test_fork_session_inherits_and_rotates_launch_enablement(plugin, monkeypatch
 
     plugin.register_features(builder, session=session, config={})
 
-    assert [feature.name for feature in builder.features] == ["event_architecture"]
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
     assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "child-session"
 
 
@@ -745,7 +745,7 @@ def test_fork_session_rejects_other_lineage_marker(plugin, monkeypatch):
 
     plugin.register_features(builder, session=session, config={})
 
-    assert builder.features == []
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
     assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
 
 
@@ -764,7 +764,7 @@ def test_explicit_false_disables_fork_inheritance(plugin, monkeypatch):
         config={"event_architecture": {"enabled": False}},
     )
 
-    assert builder.features == []
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
     assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
 
 
@@ -799,7 +799,7 @@ print(os.environ.get(module.FORK_ENABLE_ENV, ''))
         text=True,
     )
 
-    assert completed.stdout.splitlines() == ["event_architecture", "child-session"]
+    assert completed.stdout.splitlines() == ["event_architecture_settings,event_architecture", "child-session"]
 
 
 def test_real_reactor_scheduler_delivers_interrupt(plugin, tmp_path):

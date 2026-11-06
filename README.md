@@ -102,3 +102,14 @@ Commands run asynchronously through `/bin/bash -lc`, with a minimum one-second i
 Each subscription records the creating session ID. A fork may contain cloned subscription records in its saved state, but records owned by another session are inert, hidden from the tools, and never mutated or adopted. The child agent should register its own watches after `fork_agent` gives it its role.
 
 The reactor uses the live run database session ID when available, so hot `/session load` and `/session new` transitions do not delete or reassign subscriptions while runtime attributes are catching up.
+
+## `/config`
+
+`event_architecture.enablement` offers `inherit`, `enabled`, and `disabled`.
+This is configured mode, not live status: `inherit` removes the explicit enabled
+key and retains the existing fork-parent inheritance behavior. Changes require a
+backend reload, and registration-config overrides are shown read-only. Settings
+remain available when internally disabled. Edits use the existing
+`AZO_EVENT_ARCHITECTURE_CONFIG` path override, preserving other JSON values and
+file permissions. Subscription commands, regexes, and dynamic watch state are
+not exposed as configuration settings.

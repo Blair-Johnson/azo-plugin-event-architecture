@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+import tempfile
 import queue
 import re
 import signal
@@ -14,6 +16,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from agent_zoo.runtime.settings import Setting, SettingError
 
 from agent_utils import Feature, Tool, tool
 from agent_utils.components import InterruptCheck
@@ -1106,8 +1110,72 @@ def _plugin_enabled(config: Any, session: Any) -> bool:
     )
 
 
+def _settings_document(path: Path) -> dict[str, Any]:
+    """Read strictly so edits never replace malformed configuration."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SettingError("Cannot read plugin configuration") from None
+    if not isinstance(document, dict):
+        raise SettingError("Plugin configuration must be an object")
+    if "event_architecture" in document and not isinstance(document["event_architecture"], dict):
+        raise SettingError("Plugin configuration section must be an object")
+    return document
+
+
+def _save_enabled(value) -> None:
+    temporary = None
+    try:
+        path = _plugin_config_path().resolve()
+        document = _settings_document(path)
+        if value not in ("inherit", "enabled", "disabled"):
+            raise SettingError("Expected inherit, enabled, or disabled")
+        if value == "inherit":
+            document.get("event_architecture", {}).pop("enabled", None)
+        else:
+            document.setdefault("event_architecture", {})["enabled"] = value == "enabled"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix="." + path.name, delete=False) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), mode)
+            stream.write(json.dumps(document, indent=2) + "\n")
+        os.replace(temporary, path)
+    except (OSError, UnicodeError, ValueError) as exc:
+        if isinstance(exc, SettingError):
+            raise
+        raise SettingError("Cannot save plugin configuration") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _register_settings(builder, config) -> None:
+    override = _configured_enablement(config)
+
+    def get_enablement(ctx):
+        document = _settings_document(_plugin_config_path())
+        enabled = override if override is not None else _configured_enablement(document)
+        return "inherit" if enabled is None else "enabled" if enabled else "disabled"
+
+    builder.add(Feature("event_architecture_settings", components=[
+        Setting("event_architecture.enablement", "Configured enablement", "choice", get_enablement,
+                set=None if override is not None else lambda ctx, value: _save_enabled(value),
+                choices=("inherit", "enabled", "disabled"),
+                group="Event architecture", apply="reload",
+                help=("Read-only registration config override; reload to change loaded tools."
+                      if override is not None else
+                      "Configured mode, not live status. Inherit follows fork parent enablement. "
+                      "Reload to change loaded tools.")),
+    ], order=[Setting]))
+
+
 def register_features(builder, *, session, config):
     """Register model tools only when explicitly enabled or inherited by a fork."""
+    _register_settings(builder, config)
     configured = _effective_configured_enablement(config)
     enabled = _plugin_enabled(config, session)
     current_session_id = _registration_session_id(session)
