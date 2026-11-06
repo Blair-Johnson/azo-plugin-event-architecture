@@ -1130,12 +1130,9 @@ def _save_enabled(value) -> None:
     try:
         path = _plugin_config_path().resolve()
         document = _settings_document(path)
-        if value not in ("inherit", "enabled", "disabled"):
-            raise SettingError("Expected inherit, enabled, or disabled")
-        if value == "inherit":
-            document.get("event_architecture", {}).pop("enabled", None)
-        else:
-            document.setdefault("event_architecture", {})["enabled"] = value == "enabled"
+        if type(value) is not bool:
+            raise SettingError("Expected a boolean")
+        document.setdefault("event_architecture", {})["enabled"] = value
         path.parent.mkdir(parents=True, exist_ok=True)
         mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -1153,29 +1150,24 @@ def _save_enabled(value) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _register_settings(builder, config) -> None:
-    override = _configured_enablement(config)
-
-    def get_enablement(ctx):
+def _register_settings(builder) -> None:
+    def get_enabled(ctx):
         document = _settings_document(_plugin_config_path())
-        enabled = override if override is not None else _configured_enablement(document)
-        return "inherit" if enabled is None else "enabled" if enabled else "disabled"
+        return _configured_enablement(document) is True
 
     builder.add(Feature("event_architecture_settings", components=[
-        Setting("event_architecture.enablement", "Configured enablement", "choice", get_enablement,
-                set=None if override is not None else lambda ctx, value: _save_enabled(value),
-                choices=("inherit", "enabled", "disabled"),
+        Setting("event_architecture.enabled", "Enabled by default", "bool", get_enabled,
+                set=lambda ctx, value: _save_enabled(value),
                 group="Event architecture", apply="reload",
-                help=("Read-only registration config override; reload to change loaded tools."
-                      if override is not None else
-                      "Configured mode, not live status. Inherit follows fork parent enablement. "
-                      "Reload to change loaded tools.")),
+                help=("Saved default for ordinary sessions, not current fork status. "
+                      "Absent means false here; legacy fork inheritance remains until explicitly saved. "
+                      "Reload to apply; explicit launch configuration may override this default.")),
     ], order=[Setting]))
 
 
 def register_features(builder, *, session, config):
     """Register model tools only when explicitly enabled or inherited by a fork."""
-    _register_settings(builder, config)
+    _register_settings(builder)
     configured = _effective_configured_enablement(config)
     enabled = _plugin_enabled(config, session)
     current_session_id = _registration_session_id(session)

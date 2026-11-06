@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils import PipelineBuilder, State
+from agent_utils import Feature, PipelineBuilder, State, Tool
 from agent_zoo.runtime.settings import Setting, SettingError, SettingsContext, SettingsRegistry
 import event_architecture as plugin
 
@@ -34,10 +34,12 @@ def settings_file(tmp_path, monkeypatch):
     return path
 
 
-def registry(config=None):
-    session = SimpleNamespace(state=State())
+def registry(config=None, session=None):
+    session = session or SimpleNamespace(state=State())
     builder = PipelineBuilder(session)
     plugin.register_features(builder, session=session, config=config or {})
+    if builder.has("event_architecture"):
+        builder.add(Feature("test_runtime_order", order=[Tool, plugin.CommandWatchCheck]))
     # Build the normal registration, including its settings while disabled.
     components = builder.build()
     settings = [component for component in components if isinstance(component, Setting)]
@@ -50,20 +52,20 @@ def registry(config=None):
 def edit(registry, ctx, value):
     return registry.handle({"type": "plugin_settings", "request_id": "test", "action": "set",
                            "binding": registry.binding,
-                           "key": "event_architecture.enablement", "value": value}, ctx)
+                           "key": "event_architecture.enabled", "value": value}, ctx)
 
 
 def test_disabled_registration_round_trip(settings_file):
     original = load(settings_file)
     reg, ctx, builder = registry()
     row, = reg.catalog(ctx)
-    assert row["value"] == "disabled"
-    assert row["kind"] == "choice"
+    assert row["value"] is False
+    assert row["kind"] == "bool"
     assert row["apply"] == "reload" and row["writable"]
     assert row["error"] is None
     assert not builder.has('event_architecture')
     assert "private prompt" not in json.dumps(reg.catalog(ctx))
-    assert edit(reg, ctx, "enabled")["ok"]
+    assert edit(reg, ctx, True)["ok"]
     expected = original.copy()
     expected["event_architecture"]["enabled"] = True
     assert load(settings_file) == expected
@@ -74,7 +76,7 @@ def test_disabled_registration_round_trip(settings_file):
     fresh = PipelineBuilder(session)
     plugin.register_features(fresh, session=session, config={})
     assert fresh.has('event_architecture')
-    assert reg.catalog(ctx)[0]["value"] == "enabled"
+    assert reg.catalog(ctx)[0]["value"] is True
     assert list(settings_file.parent.iterdir()) == [settings_file]
 
 
@@ -84,9 +86,9 @@ def test_bad_file_is_never_overwritten(settings_file, broken):
     settings_file.write_text(broken)
     before = settings_file.read_bytes()
     assert reg.catalog(ctx)[0]["error"] is not None
-    assert not edit(reg, ctx, "enabled")["ok"]
+    assert not edit(reg, ctx, True)["ok"]
     with pytest.raises(SettingError):
-        plugin._save_enabled("enabled")
+        plugin._save_enabled(True)
     assert settings_file.read_bytes() == before
 
 
@@ -96,7 +98,7 @@ def test_failed_replace_preserves_file_and_cleans_temp(settings_file, monkeypatc
     def fail(*args):
         raise OSError("private path must not leak")
     monkeypatch.setattr(plugin.os, "replace", fail)
-    result = edit(reg, ctx, "enabled")
+    result = edit(reg, ctx, True)
     assert not result["ok"]
     assert "private path" not in json.dumps(result)
     assert settings_file.read_bytes() == before
@@ -119,31 +121,73 @@ def test_unreadable_file_is_safe(settings_file, monkeypatch):
     assert row["error"] is not None
     assert "private path" not in json.dumps(row)
     with pytest.raises(SettingError):
-        plugin._save_enabled("enabled")
+        plugin._save_enabled(True)
 
 
-def test_registration_override_is_readonly(settings_file):
-    reg, ctx, _ = registry({"event_architecture": {"enabled": False}})
+@pytest.mark.parametrize("override", [False, True])
+def test_registration_override_does_not_replace_or_lock_saved_default(settings_file, override):
+    saved = document()
+    saved["event_architecture"]["enabled"] = not override
+    settings_file.write_text(dump(saved))
+    config = {"event_architecture": {"enabled": override}}
+    reg, ctx, builder = registry(config)
     row, = reg.catalog(ctx)
-    assert row["value"] == "disabled"
-    assert not row["writable"]
-    before = settings_file.read_bytes()
-    assert edit(reg, ctx, "enabled")["error"]["code"] == "read_only"
-    assert settings_file.read_bytes() == before
+    assert row["value"] is not override
+    assert row["writable"] and row["kind"] == "bool"
+    assert builder.has("event_architecture") is override
+    assert edit(reg, ctx, override)["ok"]
+    assert edit(reg, ctx, not override)["ok"]
+    assert reg.catalog(ctx)[0]["value"] is not override
+    assert load(settings_file)["event_architecture"]["enabled"] is not override
+    assert config == {"event_architecture": {"enabled": override}}
+    assert builder.has("event_architecture") is override
+    fresh, fresh_ctx, fresh_builder = registry(config)
+    assert fresh_builder.has("event_architecture") is override
+    assert fresh.catalog(fresh_ctx)[0]["value"] is not override
 
 
 def test_missing_file_preserves_absent_defaults(settings_file):
     settings_file.unlink()
     reg, ctx, _ = registry()
     assert not settings_file.exists()
-    assert edit(reg, ctx, "enabled")["ok"]
+    assert reg.catalog(ctx)[0]["value"] is False
+    assert edit(reg, ctx, True)["ok"]
     assert load(settings_file) == {"event_architecture": {"enabled": True}}
 
 
-def test_inherit_removes_only_enabled(settings_file):
+@pytest.mark.parametrize("value", ["inherit", "enabled", "disabled"])
+def test_old_choices_are_rejected(settings_file, value):
     reg, ctx, _ = registry()
-    expected = load(settings_file)
-    expected["event_architecture"].pop("enabled")
-    assert edit(reg, ctx, "inherit")["ok"]
-    assert reg.catalog(ctx)[0]["value"] == "inherit"
-    assert load(settings_file) == expected
+    before = settings_file.read_bytes()
+    assert not edit(reg, ctx, value)["ok"]
+    with pytest.raises(SettingError):
+        plugin._save_enabled(value)
+    assert settings_file.read_bytes() == before
+
+
+def test_fork_inheritance_is_not_the_saved_default(settings_file, monkeypatch):
+    saved = document()
+    saved["event_architecture"].pop("enabled")
+    settings_file.write_text(dump(saved))
+    before = settings_file.read_bytes()
+    state = State()
+    state._session_kind = "fork"
+    state._parent_session_id = "parent"
+    session = SimpleNamespace(state=state)
+    monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent")
+    assert plugin._plugin_enabled({}, session)
+    reg, ctx, builder = registry(session=session)
+    assert builder.has("event_architecture")
+    row, = reg.catalog(ctx)
+    assert row["value"] is False and row["kind"] == "bool"
+    assert not row["choices"]
+    assert settings_file.read_bytes() == before
+    assert edit(reg, ctx, False)["ok"]
+    assert load(settings_file)["event_architecture"]["enabled"] is False
+    assert reg.catalog(ctx)[0]["value"] is False
+    # Saving defaults does not remove active fork tools or their inheritance marker.
+    assert builder.has("event_architecture")
+    assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "parent"
+    # An explicit saved default is honored on a subsequent registration.
+    _, _, fresh = registry(session=session)
+    assert not fresh.has("event_architecture")

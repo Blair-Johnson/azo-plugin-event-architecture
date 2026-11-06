@@ -105,11 +105,13 @@ The reactor uses the live run database session ID when available, so hot `/sessi
 
 ## `/config`
 
-`event_architecture.enablement` offers `inherit`, `enabled`, and `disabled`.
-This is configured mode, not live status: `inherit` removes the explicit enabled
-key and retains the existing fork-parent inheritance behavior. Changes require a
-backend reload, and registration-config overrides are shown read-only. Settings
-remain available when internally disabled. Edits use the existing
-`AZO_EVENT_ARCHITECTURE_CONFIG` path override, preserving other JSON values and
-file permissions. Subscription commands, regexes, and dynamic watch state are
-not exposed as configuration settings.
+`event_architecture.enabled` is a boolean saved default for ordinary sessions,
+not current fork status. An absent saved key displays false without writing it;
+saving writes an explicit boolean. Legacy fork-parent inheritance still operates
+while the key is absent, but is not an option in `/config`. Changes require a
+backend reload and do not alter active tools or launch overrides. Explicit
+launch configuration can still override the saved default; the row always reads
+and edits the file, even when an override is active. Settings remain available
+when internally disabled. Edits use the existing `AZO_EVENT_ARCHITECTURE_CONFIG`
+path override, preserving other JSON values and file permissions. Subscription
+commands, regexes, and dynamic watch state are not exposed.
