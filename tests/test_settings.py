@@ -6,8 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils import Feature, PipelineBuilder, State, Tool
-from agent_zoo.runtime.settings import Setting, SettingError, SettingsContext, SettingsRegistry
+from agent_utils.core.pipeline import Feature, PipelineBuilder
+from agent_utils.core.state import State
+from agent_utils.core.tool import Tool
+from agent_zoo.features.settings import Setting, SettingError, SettingsContext, SettingsRegistry
 import event_architecture as plugin
 
 
@@ -36,17 +38,17 @@ def settings_file(tmp_path, monkeypatch):
 
 def registry(config=None, session=None):
     session = session or SimpleNamespace(state=State())
-    builder = PipelineBuilder(session)
+    builder = PipelineBuilder()
     plugin.register_features(builder, session=session, config=config or {})
     if builder.has("event_architecture"):
         builder.add(Feature("test_runtime_order", order=[Tool, plugin.CommandWatchCheck]))
     # Build the normal registration, including its settings while disabled.
-    components = builder.build()
-    settings = [component for component in components if isinstance(component, Setting)]
+    pipeline = builder.build()
+    settings = [component for component in pipeline.components if isinstance(component, Setting)]
     result = SettingsRegistry(settings)
     assert result.error is None
     assert len(settings) == 1
-    return result, SettingsContext(session), builder
+    return result, SettingsContext(state=session.state, emit=lambda _ev: None), builder
 
 
 def edit(registry, ctx, value):
@@ -73,7 +75,7 @@ def test_disabled_registration_round_trip(settings_file):
     # The existing builder is not live-mutated by a reload-scoped setting.
     assert not builder.has('event_architecture')
     session = SimpleNamespace(state=State())
-    fresh = PipelineBuilder(session)
+    fresh = PipelineBuilder()
     plugin.register_features(fresh, session=session, config={})
     assert fresh.has('event_architecture')
     assert reg.catalog(ctx)[0]["value"] is True

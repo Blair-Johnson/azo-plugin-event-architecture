@@ -10,7 +10,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils import Entry, State, ToolCall
+from agent_utils.core.events import RenderRequested, RunToolCall, TurnSettled
+from agent_utils.core.io import SubmitOp
+from agent_utils.core.state import Entry, State, ToolCall
+from agent_utils.features.core import SchemaPublisher
+from agent_zoo.events import ForkSessionOp, ShutdownRequested, SuspendRequested
 
 
 PLUGIN_PATH = Path(__file__).parents[1] / "src" / "event_architecture.py"
@@ -34,26 +38,15 @@ def plugin(monkeypatch, tmp_path):
     return load_plugin()
 
 
-class FakeSessionIO:
-    def __init__(self, session_id: str = "session-a") -> None:
-        self.session_id = session_id
-        self.sent = []
-
-    def send(self, channel, payload, *, client_id=""):
-        self.sent.append((channel, payload, client_id))
-        return SimpleNamespace(channel=channel, payload=payload, client_id=client_id)
-
-
 def make_state(session_id: str = "session-a") -> State:
     state = State()
     state._session_id = session_id
     state.run_db = SimpleNamespace(session_id=session_id)
-    state.session_io = FakeSessionIO(session_id)
     state.pending_tool_calls = []
     state.pending_interrupts = []
     state._interrupt_state = {}
     state.tool_schemas = {}
-    state.terminal_cwd = str(Path.cwd())
+    state.cwd = str(Path.cwd())
     return state
 
 
@@ -81,23 +74,33 @@ def call_tool(tool, state: State, **kwargs):
         parsed_args=kwargs,
     )
     state.pending_tool_calls = [tc]
-    tool(state)
+    emitted = []
+    tool.handle(RunToolCall(tc), state, emitted.append)
+    state._emitted = emitted
     return tc
 
 
-def test_fork_agent_routes_existing_slash_command(plugin):
+def publish_schemas(components, state: State) -> None:
+    publisher = SchemaPublisher()
+    publisher.bind_pipeline(tuple(components))
+    publisher.handle(RenderRequested(), state, lambda _ev: None)
+
+
+def test_fork_agent_submits_fork_session_op(plugin):
     state = make_state("parent-session")
 
     tc = call_tool(plugin.fork_agent, state, message="Monitor issues independently.")
 
     assert tc.error is False
     assert "Fork requested" in tc.result
-    assert len(state.session_io.sent) == 1
-    channel, payload, client_id = state.session_io.sent[0]
-    assert channel == "slash_command"
-    assert client_id == "azo-plugin-event-architecture"
-    assert payload["raw"].startswith(f"/fork {plugin.PERSISTENT_FORK_MARKER}\n")
-    assert payload["raw"].endswith("\n\nMonitor issues independently.")
+    effects = state.io.take_outbox()
+    assert len(effects) == 1
+    assert isinstance(effects[0], SubmitOp)
+    req = effects[0].request
+    assert isinstance(req, ForkSessionOp)
+    assert req.spawn_policy == "fork"
+    assert req.first_user_message.startswith(f"{plugin.PERSISTENT_FORK_MARKER}\n")
+    assert req.first_user_message.endswith("\n\nMonitor issues independently.")
 
 
 def test_fork_agent_defaults_to_persistent_lifecycle(plugin):
@@ -106,11 +109,12 @@ def test_fork_agent_defaults_to_persistent_lifecycle(plugin):
     tc = call_tool(plugin.fork_agent, state, message="Remain available for work.")
 
     assert tc.error is False
-    raw = state.session_io.sent[0][1]["raw"]
-    assert raw.startswith(f"/fork {plugin.PERSISTENT_FORK_MARKER}\n")
-    assert plugin.PERSISTENT_FORK_GUIDANCE in raw
-    assert plugin.EPHEMERAL_FORK_MARKER not in raw
-    assert raw.endswith("\n\nRemain available for work.")
+    req = state.io.take_outbox()[0].request
+    assert isinstance(req, ForkSessionOp)
+    assert req.first_user_message.startswith(f"{plugin.PERSISTENT_FORK_MARKER}\n")
+    assert plugin.PERSISTENT_FORK_GUIDANCE in req.first_user_message
+    assert plugin.EPHEMERAL_FORK_MARKER not in req.first_user_message
+    assert req.first_user_message.endswith("\n\nRemain available for work.")
 
 
 def test_fork_agent_propagates_ephemeral_lifecycle(plugin):
@@ -125,10 +129,11 @@ def test_fork_agent_propagates_ephemeral_lifecycle(plugin):
 
     assert tc.error is False
     assert "Lifecycle: ephemeral" in (tc.result or "")
-    raw = state.session_io.sent[0][1]["raw"]
-    assert raw.startswith(f"/fork {plugin.EPHEMERAL_FORK_MARKER}\n")
-    assert plugin.EPHEMERAL_FORK_GUIDANCE in raw
-    assert raw.endswith("\n\nHandle one issue and stop.")
+    req = state.io.take_outbox()[0].request
+    assert isinstance(req, ForkSessionOp)
+    assert req.first_user_message.startswith(f"{plugin.EPHEMERAL_FORK_MARKER}\n")
+    assert plugin.EPHEMERAL_FORK_GUIDANCE in req.first_user_message
+    assert req.first_user_message.endswith("\n\nHandle one issue and stop.")
 
 
 def test_fork_agent_rejects_unknown_lifecycle(plugin):
@@ -144,9 +149,7 @@ def test_fork_agent_rejects_unknown_lifecycle(plugin):
     assert tc.error is True
     assert "persistent" in (tc.result or "")
     assert "ephemeral" in (tc.result or "")
-    assert state.session_io.sent == []
-
-
+    assert state.io.take_outbox() == []
 
 
 def test_latest_fork_lifecycle_overrides_cloned_ancestor(plugin):
@@ -193,7 +196,7 @@ def test_suspend_session_requires_adjacent_confirmation(plugin):
     assert first.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
     assert state.azo_event_suspend_confirmation_pending is True
     assert state.done is False
-    assert state.session_io.sent == []
+    assert not any(isinstance(ev, SuspendRequested) for ev in state._emitted)
 
     state.last_tool_calls = [first]
     second = call_tool(plugin.suspend_session, state)
@@ -207,13 +210,10 @@ def test_suspend_session_requires_adjacent_confirmation(plugin):
     assert state.shutdown_save is True
     assert state.shutdown_registry_status == "stopped"
     assert state.shutdown_spawned_policy == "leave"
-    assert state.session_io.sent == [
-        (
-            "control",
-            {"type": "suspend", "reason": "ephemeral fork completed"},
-            "azo-plugin-event-architecture",
-        )
-    ]
+    suspends = [ev for ev in state._emitted if isinstance(ev, SuspendRequested)]
+    assert len(suspends) == 1
+    assert suspends[0].reason == "ephemeral fork completed"
+    assert suspends[0].spawned_policy == "leave"
 
 
 def test_suspend_session_confirmation_resets_after_other_tool(plugin):
@@ -275,7 +275,6 @@ def test_suspend_session_rejects_confirmation_bundled_with_other_tool(plugin):
 def test_owned_subscriptions_are_session_local_and_non_destructive(plugin):
     state = make_state("child-session")
     state._session_id = "stale-parent-session"
-    state.session_io.session_id = "stale-parent-session"
     state.azo_event_subscriptions = {
         "parent": {
             "id": "parent",
@@ -411,6 +410,7 @@ class FakeReactor:
     def __init__(self, observations, generation=3):
         self.observations = list(observations)
         self.synced = []
+        self.cleaned = False
         self.current_generation = generation
 
     def sync(self, session_id, specs):
@@ -420,6 +420,9 @@ class FakeReactor:
         observations = self.observations
         self.observations = []
         return observations
+
+    def cleanup(self):
+        self.cleaned = True
 
 
 def test_interrupt_check_discards_stale_revision_and_fires_current(plugin):
@@ -460,11 +463,15 @@ def test_interrupt_check_discards_stale_revision_and_fires_current(plugin):
         ]
     )
 
-    plugin.CommandWatchCheck(reactor)(state)
+    check = plugin.CommandWatchCheck(reactor)
+    check.handle(TurnSettled(), state, lambda _ev: None)
 
     assert reactor.synced[-1][0] == "session-a"
     assert len(state.pending_interrupts) == 1
     assert "READY" in state.pending_interrupts[0]
+
+    check.handle(ShutdownRequested(), state, lambda _ev: None)
+    assert reactor.cleaned is True
 
 
 def test_execute_command_captures_bounded_tail(plugin, tmp_path):
@@ -472,7 +479,7 @@ def test_execute_command_captures_bounded_tail(plugin, tmp_path):
         "watch-1",
         {
             "revision": "rev",
-            "command": "python -c 'print(\"x\" * 5000)'",
+            "command": f"{sys.executable} -c 'print(\"x\" * 5000)'",
             "cwd": str(tmp_path),
             "timeout_seconds": 5,
             "output_limit_bytes": 1024,
@@ -508,7 +515,7 @@ def test_execute_command_kills_background_descendant_after_shell_exit(plugin, tm
         {
             "revision": "rev",
             "command": (
-                "python -c 'import signal,time; "
+                f"{sys.executable} -c 'import signal,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)' &"
             ),
             "cwd": str(tmp_path),
@@ -652,7 +659,7 @@ def test_ephemeral_fork_registration_adds_suspend_tool(plugin, monkeypatch):
     }
     assert "suspend_session" in tool_names
     assert plugin.suspend_session.available(session.state) is True
-    plugin.suspend_session(session.state)
+    publish_schemas(components, session.state)
     assert session.state.tool_schemas["suspend_session"]["available"] is True
 
 
@@ -673,7 +680,7 @@ def test_persistent_fork_registration_gates_suspend_tool(plugin, monkeypatch):
     }
     assert "suspend_session" in tool_names
     assert plugin.suspend_session.available(session.state) is False
-    plugin.suspend_session(session.state)
+    publish_schemas(components, session.state)
     assert session.state.tool_schemas["suspend_session"]["available"] is False
 
 
@@ -694,7 +701,7 @@ def test_nonfork_registration_gates_suspend_tool(plugin, monkeypatch):
     }
     assert "suspend_session" in tool_names
     assert plugin.suspend_session.available(session.state) is False
-    plugin.suspend_session(session.state)
+    publish_schemas(components, session.state)
     assert session.state.tool_schemas["suspend_session"]["available"] is False
 
 
@@ -709,11 +716,12 @@ def test_suspend_tool_becomes_available_after_fork_state_is_restored(plugin, mon
         config={"event_architecture": {"enabled": True}},
     )
 
-    assert plugin.suspend_session in builder.features[1].components
+    components = builder.features[1].components
+    assert plugin.suspend_session in components
     assert plugin.suspend_session.available(session.state) is False
 
     authorize_ephemeral_fork(plugin, session.state)
-    plugin.suspend_session(session.state)
+    publish_schemas(components, session.state)
 
     assert plugin.suspend_session.available(session.state) is True
     assert session.state.tool_schemas["suspend_session"]["available"] is True
@@ -793,7 +801,7 @@ print(os.environ.get(module.FORK_ENABLE_ENV, ''))
 """
 
     completed = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-P", "-c", code],
         check=True,
         capture_output=True,
         text=True,
@@ -829,7 +837,7 @@ def test_real_reactor_scheduler_delivers_interrupt(plugin, tmp_path):
     deadline = time.monotonic() + 3.0
 
     while time.monotonic() < deadline and not state.pending_interrupts:
-        check(state)
+        check.handle(TurnSettled(), state, lambda _ev: None)
         time.sleep(0.02)
 
     reactor.cleanup()

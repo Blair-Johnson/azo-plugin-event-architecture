@@ -5,23 +5,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import stat
-import tempfile
 import queue
 import re
 import signal
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from agent_zoo.runtime.settings import Setting, SettingError
-
-from agent_utils import Feature, Tool, tool
-from agent_utils.components import InterruptCheck
-from agent_utils.session_cwd import get_session_cwd
+from agent_utils.core.events import Event, RunToolCall, TurnSettled
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import State
+from agent_utils.core.tool import Tool, tool
+from agent_utils.features.interrupts import InterruptCheck
+from agent_zoo.events import ForkSessionOp, ShutdownRequested, SuspendRequested
+from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.features.turn import build_checkpoint_document
 
 
 STATE_ATTR = "azo_event_subscriptions"
@@ -50,6 +53,16 @@ SUSPEND_CONFIRMATION_MESSAGE = (
     "You have requested to suspend this session, have you completed all work "
     "originally allocated to this fork? Call suspend_session() again to confirm."
 )
+
+
+def _get_session_cwd(state: Any) -> str:
+    cwd = str(
+        getattr(state, "cwd", "")
+        or getattr(state, "session_cwd", "")
+        or getattr(state, "terminal_cwd", "")
+        or ""
+    ).strip()
+    return cwd or os.getcwd()
 
 
 class CommandObservation:
@@ -182,7 +195,6 @@ class CommandWatchReactor:
             except queue.Empty:
                 return observations
 
-
     @property
     def current_generation(self) -> int:
         with self._lock:
@@ -194,6 +206,7 @@ class CommandWatchReactor:
                 self._events.get_nowait()
             except queue.Empty:
                 return
+
     def cleanup(self) -> None:
         """Stop scheduling and terminate every active command process group."""
         self._stop.set()
@@ -608,6 +621,7 @@ def _validate_subscription_inputs(
     timeout = max(0.1, float(timeout_seconds))
     return clean_name, clean_command, clean_regex, clean_trigger, interval, timeout
 
+
 def _observation_text(spec: dict[str, Any], observation: CommandObservation) -> str:
     source = str(spec.get("match_stream") or "stdout")
     if source == "stderr":
@@ -707,11 +721,13 @@ def _format_error_interrupt(
         ]
     )
 
+
 class CommandWatchCheck(InterruptCheck):
     """Synchronize subscriptions and deliver matching command observations."""
 
     check_name = "command_watch_subscriptions"
     cooldown = 0
+    handles = (TurnSettled, ShutdownRequested)
     optional_reads = {STATE_ATTR, REACTOR_STATE_ATTR, "run_db", "_session_id", "session_io"}
     writes = {STATE_ATTR, REACTOR_STATE_ATTR}
 
@@ -719,7 +735,12 @@ class CommandWatchCheck(InterruptCheck):
         self.reactor = reactor
         self.init = {STATE_ATTR: dict, REACTOR_STATE_ATTR: lambda: reactor}
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, ShutdownRequested):
+            self.reactor.cleanup()
+            return
+        if not isinstance(event, TurnSettled):
+            return
         setattr(state, REACTOR_STATE_ATTR, self.reactor)
         session_id, subscriptions = _owned_subscriptions(state)
         self.reactor.sync(session_id, subscriptions)
@@ -738,7 +759,6 @@ class CommandWatchCheck(InterruptCheck):
             message = _evaluate_observation(spec, observation)
             if message:
                 self._fire(state, message)
-        return state
 
     def status_line(self, state) -> str:
         session_id, subscriptions = _owned_subscriptions(state)
@@ -809,17 +829,21 @@ def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
     normalized_lifecycle = str(lifecycle or "").strip().lower()
     if normalized_lifecycle not in VALID_FORK_LIFECYCLES:
         raise ValueError("lifecycle must be 'persistent' or 'ephemeral'")
-    session_io = getattr(state, "session_io", None)
-    if session_io is None or not callable(getattr(session_io, "send", None)):
+    if state is None or getattr(state, "io", None) is None:
         raise RuntimeError("fork_agent requires a live Agent Zoo session")
     session_id = _current_session_id(state)
     if not session_id:
         raise RuntimeError("fork_agent requires a bound live session ID")
 
-    session_io.send(
-        "slash_command",
-        {"raw": f"/fork {_fork_launch_message(text, normalized_lifecycle)}"},
-        client_id="azo-plugin-event-architecture",
+    state.io.submit(
+        ForkSessionOp(
+            target_session_id="",
+            source_document=build_checkpoint_document(state),
+            first_user_message=_fork_launch_message(text, normalized_lifecycle),
+            title=str(getattr(state, "_session_title", "") or ""),
+            spawn_policy="fork",
+        ),
+        tag="session_op",
     )
     return (
         "Fork requested through the live session control path. "
@@ -831,6 +855,7 @@ def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
 class SuspendSession(Tool):
     """Ephemeral-fork-only graceful suspension tool."""
 
+    name = "suspend_session"
     optional_reads = {"entries", "last_tool_calls", "session_io", SUSPEND_CONFIRM_ATTR}
     writes = {
         SUSPEND_CONFIRM_ATTR,
@@ -843,8 +868,10 @@ class SuspendSession(Tool):
     }
     init = {SUSPEND_CONFIRM_ATTR: bool}
 
-    @staticmethod
-    def fn(state=None) -> str:
+    def available(self, state: State) -> bool:
+        return _ephemeral_fork_authorized(state)
+
+    def call(self, state: State) -> str:
         """Suspend this ephemeral fork after a required two-call confirmation."""
         previous_calls = list(getattr(state, "last_tool_calls", []) or [])
         previous_was_confirmation = (
@@ -872,14 +899,8 @@ class SuspendSession(Tool):
             return SUSPEND_CONFIRMATION_MESSAGE
 
         setattr(state, SUSPEND_CONFIRM_ATTR, False)
-        session_io = getattr(state, "session_io", None)
-        if session_io is None or not callable(getattr(session_io, "send", None)):
+        if state is None or getattr(state, "io", None) is None:
             raise RuntimeError("suspend_session requires a live Agent Zoo session")
-        session_io.send(
-            "control",
-            {"type": "suspend", "reason": "ephemeral fork completed"},
-            client_id="azo-plugin-event-architecture",
-        )
         state.done = True
         state.shutdown_reason = "suspend"
         state.shutdown_save = True
@@ -888,8 +909,24 @@ class SuspendSession(Tool):
         state.shutdown = True
         return "Ephemeral fork suspension confirmed; saving and suspending this session."
 
-    def available(self, state) -> bool:
-        return _ephemeral_fork_authorized(state)
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        was_shutdown = bool(getattr(state, "shutdown", False))
+        super().handle(event, state, emit)
+        if (
+            isinstance(event, RunToolCall)
+            and event.tool_call.name == self.name
+            and not event.tool_call.error
+            and bool(getattr(state, "shutdown", False))
+            and not was_shutdown
+        ):
+            emit(
+                SuspendRequested(
+                    reason="ephemeral fork completed",
+                    save=True,
+                    spawned_policy="leave",
+                    registry_status="stopped",
+                )
+            )
 
 
 suspend_session = SuspendSession()
@@ -954,7 +991,7 @@ def subscribe_interrupt(
     if any(str(spec.get("name") or "") == clean_name for spec in subscriptions.values()):
         raise ValueError(f"subscription name already exists: {clean_name}")
 
-    base_cwd = Path(get_session_cwd(state)).expanduser()
+    base_cwd = Path(_get_session_cwd(state)).expanduser()
     resolved_cwd = Path(cwd).expanduser() if str(cwd or "").strip() else base_cwd
     if not resolved_cwd.is_absolute():
         resolved_cwd = base_cwd / resolved_cwd
