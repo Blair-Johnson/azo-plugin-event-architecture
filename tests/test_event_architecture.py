@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import threading
@@ -10,11 +11,32 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils.core.events import RenderRequested, RunToolCall, TurnSettled
+from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, RunToolCall, TurnSettled
 from agent_utils.core.io import SubmitOp
+from agent_utils.core.pipeline import Feature, PipelineBuilder
+from agent_utils.core.session import Session
 from agent_utils.core.state import Entry, State, ToolCall
-from agent_utils.features.core import SchemaPublisher
-from agent_zoo.events import ForkSessionOp, ShutdownRequested, SuspendRequested
+from agent_utils.core.tool import Tool
+from agent_utils.features.core import IoFence, SchemaPublisher
+from agent_utils.runtime.simulation import SimOutcome, SimulationRuntime
+from agent_zoo.drivers.sessions import (
+    SimSessionDriver,
+    _build_runtime_launch,
+    serialize_artifact,
+)
+from agent_zoo.events import (
+    EmitNotice,
+    ForkSessionOp,
+    ProjectionRequested,
+    PublishView,
+    SessionArtifact,
+    SessionSource,
+    SessionSpec,
+    ShutdownRequested,
+    SpawnSession,
+    SuspendRequested,
+)
+from agent_zoo.storage.store import CommitReceipt
 
 
 PLUGIN_PATH = Path(__file__).parents[1] / "src" / "event_architecture.py"
@@ -99,8 +121,11 @@ def test_fork_agent_submits_fork_session_op(plugin):
     req = effects[0].request
     assert isinstance(req, ForkSessionOp)
     assert req.spawn_policy == "fork"
+    assert req.spawn_child is False
     assert req.first_user_message.startswith(f"{plugin.PERSISTENT_FORK_MARKER}\n")
     assert req.first_user_message.endswith("\n\nMonitor issues independently.")
+    assert effects[0].op_id in getattr(state, plugin.FORK_OPS_ATTR)
+    assert plugin.FORK_OPS_ATTR not in (req.source_document.get("attrs") or {})
 
 
 def test_fork_agent_defaults_to_persistent_lifecycle(plugin):
@@ -111,6 +136,7 @@ def test_fork_agent_defaults_to_persistent_lifecycle(plugin):
     assert tc.error is False
     req = state.io.take_outbox()[0].request
     assert isinstance(req, ForkSessionOp)
+    assert req.spawn_child is False
     assert req.first_user_message.startswith(f"{plugin.PERSISTENT_FORK_MARKER}\n")
     assert plugin.PERSISTENT_FORK_GUIDANCE in req.first_user_message
     assert plugin.EPHEMERAL_FORK_MARKER not in req.first_user_message
@@ -131,9 +157,271 @@ def test_fork_agent_propagates_ephemeral_lifecycle(plugin):
     assert "Lifecycle: ephemeral" in (tc.result or "")
     req = state.io.take_outbox()[0].request
     assert isinstance(req, ForkSessionOp)
+    assert req.spawn_child is False
     assert req.first_user_message.startswith(f"{plugin.EPHEMERAL_FORK_MARKER}\n")
     assert plugin.EPHEMERAL_FORK_GUIDANCE in req.first_user_message
     assert req.first_user_message.endswith("\n\nHandle one issue and stop.")
+
+
+@pytest.mark.parametrize("lifecycle", ["persistent", "ephemeral"])
+def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path):
+    config = {
+        "event_architecture": {"enabled": True},
+        "llm": {"default": "openai/gpt-5"},
+        "pilot": {"_env_name": "dev"},
+        "_runtime_launch": {
+            "config_path": "/tmp/azo.yaml",
+            "config_sets": ["event_architecture.enabled=true"],
+        },
+    }
+    session = Session(cwd=str(tmp_path))
+    state = session.state
+    state._session_id = "parent-session"
+    state.run_db = SimpleNamespace(session_id="parent-session")
+    state._project_name = "demo-project"
+    state._session_title = "Parent Work"
+    state._agent_zoo_context = {
+        "project_name": "demo-project",
+        "pipeline_key": "default",
+        "state_root": str(tmp_path / "state"),
+        "project_store_root": str(tmp_path / "store"),
+    }
+    state._persistence_local_root = str(tmp_path / "local")
+    state.config = config
+    state.pending_tool_calls = []
+
+    seen_forks: list[ForkSessionOp] = []
+    seen_spawns: list[SpawnSession] = []
+    seen_views: list[PublishView] = []
+    seen_notices: list[EmitNotice] = []
+    seen_projections: list[ProjectionRequested] = []
+
+    class _EventSpy:
+        handles = (EmitNotice, ProjectionRequested)
+
+        def handle(self, ev, _st, _emit):
+            if isinstance(ev, EmitNotice):
+                seen_notices.append(ev)
+            elif isinstance(ev, ProjectionRequested):
+                seen_projections.append(ev)
+
+    builder = PipelineBuilder()
+    builder.add(Feature("test_core", components=[IoFence()], order=[IoFence, Tool]))
+    plugin.register_features(builder, session=session, config=config)
+    builder.add(
+        Feature(
+            "test_order",
+            components=[_EventSpy()],
+            order=[plugin.ForkSessionCoordinator, _EventSpy, Tool, plugin.CommandWatchCheck],
+        )
+    )
+    session.pipeline = builder.build()
+    session.ensure_initialized()
+
+    sim = SimulationRuntime(session)
+    sim_sessions = SimSessionDriver().register(sim)
+
+    def _capture_session_req(op_id, req, runtime):
+        if isinstance(req, SpawnSession):
+            seen_spawns.append(req)
+        return sim_sessions.handle(op_id, req, runtime)
+
+    sim.register_handler(SpawnSession, _capture_session_req)
+    sim.register_handler(
+        ForkSessionOp,
+        lambda _op, req, _rt: (
+            seen_forks.append(req),
+            SimOutcome(
+                value=CommitReceipt(
+                    session_id="child-fork-1234",
+                    instance_id="fork-ckpt-inst-1",
+                    revision_id="rev-fork-1",
+                    parent_revision_id=None,
+                    local_saved=True,
+                ),
+                delay=0.01,
+            ),
+        )[1],
+    )
+    sim.register_handler(
+        PublishView,
+        lambda _op, req, _rt: (
+            seen_views.append(req),
+            SimOutcome(value=True, delay=0.0),
+        )[1],
+    )
+
+    tc = ToolCall(
+        id="call-fork-1",
+        name="fork_agent",
+        raw_args="{}",
+        parsed_args={"message": "Handle incoming events.", "lifecycle": lifecycle},
+    )
+    state.pending_tool_calls = [tc]
+    sim.inject(RunToolCall(tc))
+    sim.run_until_idle()
+
+    assert tc.error is False
+    assert len(seen_forks) == 1
+    assert seen_forks[0].spawn_child is False
+    assert seen_forks[0].spawn_policy == "fork"
+    assert plugin.FORK_OPS_ATTR not in (seen_forks[0].source_document.get("attrs") or {})
+
+    assert len(seen_spawns) == 1
+    spawn = seen_spawns[0]
+    assert spawn.session_id == "child-fork-1234"
+    assert spawn.source == SessionSource(
+        kind="resume",
+        session_id="child-fork-1234",
+        revision_id="rev-fork-1",
+        instance_id="fork-ckpt-inst-1",
+    )
+    assert isinstance(spawn.spec, SessionSpec)
+    assert spawn.spec.project == "demo-project"
+    assert spawn.spec.workdir == str(tmp_path)
+    assert spawn.spec.model == "openai/gpt-5"
+    assert spawn.spec.pipeline_key == "default"
+    assert spawn.spec.env_name == "dev"
+    assert spawn.spec.config_path == "/tmp/azo.yaml"
+    assert spawn.spec.config_sets == ("event_architecture.enabled=true",)
+    assert spawn.spec.kind == "fork"
+    assert spawn.spec.spawn_policy == "fork"
+    assert spawn.spec.parent_session_id == "parent-session"
+    assert spawn.spec.lifetime == "independent"
+    assert spawn.spec.extra_env == ((plugin.FORK_ENABLE_ENV, "parent-session"),)
+    assert spawn.launch_metadata["fork_lifecycle"] == lifecycle
+    assert spawn.launch_metadata["parent_session_id"] == "parent-session"
+
+    # Verify the SessionSpec + SessionSource build a valid RuntimeLaunch.
+    launch = _build_runtime_launch(
+        session_id=spawn.session_id,
+        instance_id="runtime-inst-1",
+        source=spawn.source,
+        spec=spawn.spec,
+    )
+    assert launch.target.session_id == "child-fork-1234"
+    assert launch.spawn_policy == "fork"
+    assert launch.kind == "fork"
+
+    assert len(spawn.inputs) == 1
+    artifact = spawn.inputs[0]
+    assert isinstance(artifact, SessionArtifact)
+    assert artifact.name == plugin.FORK_ARTIFACT_NAME
+    assert artifact.kind == "json"
+    assert artifact.data["lifecycle"] == lifecycle
+    assert artifact.data["parent_session_id"] == "parent-session"
+
+    assert len(sim_sessions.sessions) == 1
+    sim_child = next(iter(sim_sessions.sessions.values()))
+    assert sim_child.session_id == "child-fork-1234"
+    assert sim_child.inputs == spawn.inputs
+
+    assert len(seen_views) == 1
+    assert seen_views[0].attach == {"session_id": "child-fork-1234", "kind": "fork"}
+    assert any(
+        ev.level == "info" and f"Spawned {lifecycle} fork session" in ev.text
+        for ev in seen_notices
+    )
+    assert len(seen_projections) >= 1
+    assert getattr(state, plugin.FORK_OPS_ATTR) == {}
+
+
+def test_fork_session_coordinator_handles_fork_and_spawn_failures(plugin):
+    state = make_state("parent-session")
+    coordinator = plugin.ForkSessionCoordinator()
+
+    # 1. ForkSessionOp IoFailed
+    tc = call_tool(plugin.fork_agent, state, message="Do work.", lifecycle="ephemeral")
+    assert tc.error is False
+    fork_op_id = state.io.take_outbox()[0].op_id
+    emitted = []
+    coordinator.handle(IoFailed(op_id=fork_op_id, error=RuntimeError("boom")), state, emitted.append)
+    assert state.io.take_outbox() == []
+    assert any(isinstance(ev, EmitNotice) and ev.level == "error" and "boom" in ev.text for ev in emitted)
+    assert any(isinstance(ev, ProjectionRequested) for ev in emitted)
+
+    # 2. ForkSessionOp returns unsaved CommitReceipt
+    call_tool(plugin.fork_agent, state, message="Do work.")
+    fork_op_id = state.io.take_outbox()[0].op_id
+    emitted = []
+    coordinator.handle(
+        IoCompleted(
+            op_id=fork_op_id,
+            value=CommitReceipt(
+                session_id="child-unsaved",
+                instance_id="inst-1",
+                revision_id=None,
+                parent_revision_id=None,
+                local_saved=False,
+                error="disk full",
+            ),
+        ),
+        state,
+        emitted.append,
+    )
+    assert state.io.take_outbox() == []
+    assert any(isinstance(ev, EmitNotice) and ev.level == "error" and "disk full" in ev.text for ev in emitted)
+
+    # 3. ForkSessionOp succeeds, SpawnSession fails
+    call_tool(plugin.fork_agent, state, message="Do work.")
+    fork_op_id = state.io.take_outbox()[0].op_id
+    emitted = []
+    coordinator.handle(
+        IoCompleted(
+            op_id=fork_op_id,
+            value={"session_id": "child-2", "revision_id": "rev-2", "instance_id": "inst-2"},
+        ),
+        state,
+        emitted.append,
+    )
+    spawn_effects = state.io.take_outbox()
+    assert len(spawn_effects) == 1
+    assert isinstance(spawn_effects[0].request, SpawnSession)
+
+    emitted = []
+    coordinator.handle(
+        IoFailed(op_id=spawn_effects[0].op_id, error=OSError("spawn failed")),
+        state,
+        emitted.append,
+    )
+    assert state.io.take_outbox() == []
+    assert any(isinstance(ev, EmitNotice) and ev.level == "error" and "spawn failed" in ev.text for ev in emitted)
+    assert any(isinstance(ev, ProjectionRequested) for ev in emitted)
+
+
+def test_ephemeral_fork_authorized_from_session_artifact_inputs(plugin, monkeypatch):
+    artifact = plugin._build_fork_lifecycle_artifact("ephemeral", parent_session_id="parent-session")
+    monkeypatch.setenv(plugin.SESSION_INPUTS_ENV, json.dumps([serialize_artifact(artifact)]))
+
+    child = make_state("child-session")
+    child._session_kind = "fork"
+    child._parent_session_id = "parent-session"
+    assert plugin._latest_fork_lifecycle(child) == "ephemeral"
+    assert plugin.suspend_session.available(child) is True
+
+    # Mismatched parent lineage rejects the inherited artifact.
+    unrelated = make_state("other-child")
+    unrelated._session_kind = "fork"
+    unrelated._parent_session_id = "different-parent"
+    assert plugin._latest_fork_lifecycle(unrelated) == ""
+    assert plugin.suspend_session.available(unrelated) is False
+
+    # Root sessions ignore fork_lifecycle artifacts.
+    root = make_state("root-session")
+    root._session_kind = "default"
+    assert plugin._latest_fork_lifecycle(root) == ""
+    assert plugin.suspend_session.available(root) is False
+
+    # Newer transcript marker always overrides an inherited artifact.
+    child.entries.append(
+        Entry(
+            messages=[{"role": "user", "content": f"{plugin.PERSISTENT_FORK_MARKER}\nnow persistent"}],
+            index=0,
+            step=0,
+        )
+    )
+    assert plugin._latest_fork_lifecycle(child) == "persistent"
+    assert plugin.suspend_session.available(child) is False
 
 
 def test_fork_agent_rejects_unknown_lifecycle(plugin):
@@ -638,6 +926,7 @@ def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
         "list_interrupt_subscriptions",
         "remove_interrupt_subscription",
     }.issubset(tool_names)
+    assert any(isinstance(component, plugin.ForkSessionCoordinator) for component in components)
     assert any(isinstance(component, plugin.CommandWatchCheck) for component in components)
 
 

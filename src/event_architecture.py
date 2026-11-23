@@ -17,12 +17,24 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from agent_utils.core.events import Event, RunToolCall, TurnSettled
+from agent_utils.core.events import Event, IoCompleted, IoFailed, RunToolCall, TurnSettled
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.core.tool import Tool, tool
+from agent_utils.features.core import IoFence
 from agent_utils.features.interrupts import InterruptCheck
-from agent_zoo.events import ForkSessionOp, ShutdownRequested, SuspendRequested
+from agent_zoo.events import (
+    EmitNotice,
+    ForkSessionOp,
+    ProjectionRequested,
+    PublishView,
+    SessionArtifact,
+    SessionSource,
+    SessionSpec,
+    ShutdownRequested,
+    SpawnSession,
+    SuspendRequested,
+)
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.turn import build_checkpoint_document
 
@@ -30,6 +42,9 @@ from agent_zoo.features.turn import build_checkpoint_document
 STATE_ATTR = "azo_event_subscriptions"
 REACTOR_STATE_ATTR = "azo_event_reactor_runtime"
 SUSPEND_CONFIRM_ATTR = "azo_event_suspend_confirmation_pending"
+FORK_OPS_ATTR = "_azo_event_fork_ops"
+FORK_ARTIFACT_NAME = "fork_lifecycle"
+SESSION_INPUTS_ENV = "AZO_SESSION_INPUTS"
 FORK_ENABLE_ENV = "AZO_EVENT_ARCHITECTURE_FORK_ENABLED"
 CONFIG_PATH_ENV = "AZO_EVENT_ARCHITECTURE_CONFIG"
 PLUGIN_NAME = "azo-plugin-event-architecture"
@@ -788,6 +803,43 @@ def _content_texts(content: Any) -> list[str]:
     return []
 
 
+def _fork_lifecycle_from_session_inputs(state: Any) -> str:
+    if str(getattr(state, "_session_kind", "") or "").strip().lower() != "fork":
+        return ""
+    parent_session_id = str(getattr(state, "_parent_session_id", "") or "").strip()
+    raw_inputs = getattr(state, "_azo_session_inputs", None)
+    if raw_inputs is None:
+        raw_env = str(os.environ.get(SESSION_INPUTS_ENV, "") or "").strip()
+        if not raw_env:
+            return ""
+        try:
+            raw_inputs = json.loads(raw_env)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(raw_inputs, (list, tuple)):
+        return ""
+    lifecycle = ""
+    for item in raw_inputs:
+        if isinstance(item, SessionArtifact):
+            name, data, meta = item.name, item.data, item.metadata
+        elif isinstance(item, dict):
+            name = str(item.get("name") or "")
+            data = item.get("data")
+            meta = item.get("metadata")
+        else:
+            continue
+        if name != FORK_ARTIFACT_NAME:
+            continue
+        payload = data if isinstance(data, dict) else (meta if isinstance(meta, dict) else {})
+        artifact_parent = str(payload.get("parent_session_id") or "").strip()
+        if artifact_parent and artifact_parent != parent_session_id:
+            continue
+        candidate = str(payload.get("lifecycle") or "").strip().lower()
+        if candidate in VALID_FORK_LIFECYCLES:
+            lifecycle = candidate
+    return lifecycle
+
+
 def _latest_fork_lifecycle(state: Any) -> str:
     lifecycle = ""
     for entry in getattr(state, "entries", []) or []:
@@ -803,14 +855,271 @@ def _latest_fork_lifecycle(state: Any) -> str:
                         if ephemeral_at > persistent_at
                         else "persistent"
                     )
-    return lifecycle
+    if lifecycle:
+        return lifecycle
+    return _fork_lifecycle_from_session_inputs(state)
 
 
 def _ephemeral_fork_authorized(state: Any) -> bool:
     return _latest_fork_lifecycle(state) == "ephemeral"
 
 
-@tool(optional_reads={"session_io", "run_db", "_session_id"})
+def _fork_ops(state: Any) -> dict[str, dict[str, Any]]:
+    ops = getattr(state, FORK_OPS_ATTR, None)
+    if not isinstance(ops, dict):
+        ops = {}
+        setattr(state, FORK_OPS_ATTR, ops)
+    return ops
+
+
+def _build_fork_lifecycle_artifact(
+    lifecycle: str,
+    *,
+    parent_session_id: str,
+) -> SessionArtifact:
+    return SessionArtifact(
+        name=FORK_ARTIFACT_NAME,
+        kind="json",
+        data={
+            "lifecycle": lifecycle,
+            "parent_session_id": parent_session_id,
+            "plugin": PLUGIN_NAME,
+        },
+        content_type="application/json",
+        metadata={
+            "plugin": PLUGIN_NAME,
+            "lifecycle": lifecycle,
+            "parent_session_id": parent_session_id,
+        },
+    )
+
+
+def _build_fork_session_spec(
+    state: Any,
+    *,
+    config: dict[str, Any] | None,
+    child_session_id: str,
+    parent_session_id: str,
+    first_user_message: str,
+    title: str = "",
+    description: str = "",
+) -> SessionSpec:
+    cfg = config if isinstance(config, dict) else getattr(state, "config", None)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    context = getattr(state, "_agent_zoo_context", None)
+    context = context if isinstance(context, dict) else {}
+    provenance = cfg.get("_runtime_launch") if isinstance(cfg.get("_runtime_launch"), dict) else {}
+    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    pilot_cfg = cfg.get("pilot") if isinstance(cfg.get("pilot"), dict) else {}
+
+    project = (
+        str(
+            context.get("project_name")
+            or getattr(state, "_project_name", "")
+            or cfg.get("project_name")
+            or "default"
+        ).strip()
+        or "default"
+    )
+    pipeline_key = (
+        str(
+            context.get("pipeline_key")
+            or getattr(state, "_pipeline_key", "")
+            or "default"
+        ).strip()
+        or "default"
+    )
+    return SessionSpec(
+        project=project,
+        workdir=_get_session_cwd(state),
+        model=str(llm_cfg.get("default") or getattr(state, "active_model", "") or "").strip(),
+        pipeline_key=pipeline_key,
+        env_name=str(pilot_cfg.get("_env_name") or ""),
+        config_path=str(provenance.get("config_path") or ""),
+        config_sets=tuple(str(x) for x in (provenance.get("config_sets") or ())),
+        state_root=str(context.get("state_root") or ""),
+        store_root=str(context.get("project_store_root") or context.get("store_root") or ""),
+        local_state_root=str(getattr(state, "_persistence_local_root", "") or ""),
+        kind="fork",
+        title=str(title or "").strip() or f"fork {child_session_id[:8]}",
+        description=str(description or "").strip()
+        or (f"Fork of {parent_session_id[:8]}" if parent_session_id else ""),
+        parent_session_id=parent_session_id,
+        first_user_message=first_user_message,
+        spawn_policy="fork",
+        startup_mode="normal",
+        lifetime="independent",
+        extra_env=((FORK_ENABLE_ENV, parent_session_id),) if parent_session_id else (),
+    )
+
+
+def _extract_fork_checkpoint(
+    value: Any,
+    *,
+    fallback_title: str = "",
+) -> tuple[str, str, str | None, str, str, str]:
+    receipt = value.get("receipt") if isinstance(value, dict) else value
+    if receipt is not None and getattr(receipt, "local_saved", True) is False:
+        err = str(getattr(receipt, "error", "") or "fork checkpoint was not saved locally")
+        return "", "", None, fallback_title, "", err
+
+    def _pick(field: str, fallback: str = "") -> str:
+        raw = value.get(field) if isinstance(value, dict) else getattr(value, field, None)
+        if not raw and receipt is not None and receipt is not value:
+            raw = getattr(receipt, field, None)
+        return str(raw or fallback or "").strip()
+
+    child_id = _pick("session_id")
+    rev_id = _pick("revision_id")
+    inst_id = _pick("instance_id") or None
+    title = _pick("title", fallback_title)
+    description = _pick("description")
+    if not child_id:
+        return "", rev_id, inst_id, title, description, "fork checkpoint did not return a child session ID"
+    return child_id, rev_id, inst_id, title, description, ""
+
+
+class ForkSessionCoordinator:
+    """Coordinate ``ForkSessionOp(spawn_child=False)`` -> ``SpawnSession`` -> ``PublishView(attach=...)``."""
+
+    handles = (IoCompleted, IoFailed)
+    init = {FORK_OPS_ATTR: dict}
+    optional_reads = {
+        FORK_OPS_ATTR,
+        "config",
+        "_agent_zoo_context",
+        "_project_name",
+        "_pipeline_key",
+        "_persistence_local_root",
+        "active_model",
+        "cwd",
+        "session_cwd",
+        "terminal_cwd",
+        "_session_title",
+    }
+    writes = {FORK_OPS_ATTR}
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = config if isinstance(config, dict) else None
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, (IoCompleted, IoFailed)):
+            return
+        ops = getattr(state, FORK_OPS_ATTR, None)
+        if not isinstance(ops, dict) or event.op_id not in ops:
+            return
+        pending = ops.pop(event.op_id)
+        stage = str(pending.get("stage") or "")
+        if stage == "fork_checkpoint":
+            self._handle_fork_checkpoint(event, pending, ops, state, emit)
+        elif stage == "spawn_session":
+            self._handle_spawn_session(event, pending, state, emit)
+
+    def _handle_fork_checkpoint(
+        self,
+        event: IoCompleted | IoFailed,
+        pending: dict[str, Any],
+        ops: dict[str, dict[str, Any]],
+        state: State,
+        emit: EmitFn,
+    ) -> None:
+        if isinstance(event, IoFailed):
+            emit(EmitNotice(f"Failed to fork agent session: {getattr(event, 'error', '')}", level="error"))
+            emit(ProjectionRequested())
+            return
+
+        child_id, revision_id, checkpoint_instance_id, title, description, error = (
+            _extract_fork_checkpoint(event.value, fallback_title=str(pending.get("title") or ""))
+        )
+        if error:
+            emit(EmitNotice(f"Failed to fork agent session: {error}", level="error"))
+            emit(ProjectionRequested())
+            return
+
+        parent_session_id = str(pending.get("parent_session_id") or "")
+        lifecycle = str(pending.get("lifecycle") or "persistent")
+        spec = _build_fork_session_spec(
+            state,
+            config=self.config,
+            child_session_id=child_id,
+            parent_session_id=parent_session_id,
+            first_user_message=str(pending.get("first_user_message") or ""),
+            title=title,
+            description=description,
+        )
+        spawn_op_id = state.io.submit(
+            SpawnSession(
+                session_id=child_id,
+                source=SessionSource(
+                    kind="resume",
+                    session_id=child_id,
+                    revision_id=revision_id,
+                    instance_id=checkpoint_instance_id,
+                ),
+                spec=spec,
+                wait_ready=False,
+                watch=False,
+                launch_metadata={
+                    "plugin": PLUGIN_NAME,
+                    "fork_lifecycle": lifecycle,
+                    "parent_session_id": parent_session_id,
+                },
+                inputs=(_build_fork_lifecycle_artifact(lifecycle, parent_session_id=parent_session_id),),
+            ),
+            tag="event_architecture_spawn",
+        )
+        ops[spawn_op_id] = {
+            "stage": "spawn_session",
+            "child_session_id": child_id,
+            "parent_session_id": parent_session_id,
+            "lifecycle": lifecycle,
+            "kind": "fork",
+        }
+
+    def _handle_spawn_session(
+        self,
+        event: IoCompleted | IoFailed,
+        pending: dict[str, Any],
+        state: State,
+        emit: EmitFn,
+    ) -> None:
+        if isinstance(event, IoFailed):
+            emit(
+                EmitNotice(
+                    f"Failed to spawn forked agent session: {getattr(event, 'error', '')}",
+                    level="error",
+                )
+            )
+            emit(ProjectionRequested())
+            return
+
+        val = event.value
+        get = val.get if isinstance(val, dict) else lambda key, default="": getattr(val, key, default)
+        child_id = str(get("session_id", "") or pending.get("child_session_id") or "").strip()
+        logs_dir = str(get("logs_dir", "") or get("logs", "") or "").strip()
+        stderr_path = str(get("stderr_path", "") or "").strip()
+        if not logs_dir and stderr_path:
+            logs_dir = os.path.dirname(stderr_path)
+
+        if child_id:
+            state.io.submit(
+                PublishView(attach={"session_id": child_id, "kind": str(pending.get("kind") or "fork")}),
+                tag="frontend",
+            )
+
+        lifecycle = str(pending.get("lifecycle") or "persistent")
+        short_id = child_id[:8] if child_id else ""
+        msg = f"Spawned {lifecycle} fork session · {short_id}" if short_id else f"Spawned {lifecycle} fork session."
+        if logs_dir:
+            msg += f" · logs: {logs_dir}"
+        emit(EmitNotice(msg, level="info"))
+        emit(ProjectionRequested())
+
+
+@tool(
+    optional_reads={"session_io", "run_db", "_session_id", "_session_title", FORK_OPS_ATTR},
+    writes={FORK_OPS_ATTR},
+)
 def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
     """Create an independent worker agent that can respond to future events.
 
@@ -835,16 +1144,31 @@ def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
     if not session_id:
         raise RuntimeError("fork_agent requires a bound live session ID")
 
-    state.io.submit(
+    launch_message = _fork_launch_message(text, normalized_lifecycle)
+    title = str(getattr(state, "_session_title", "") or "")
+    source_doc = build_checkpoint_document(state)
+    attrs = source_doc.get("attrs")
+    if isinstance(attrs, dict):
+        attrs.pop(FORK_OPS_ATTR, None)
+
+    op_id = state.io.submit(
         ForkSessionOp(
             target_session_id="",
-            source_document=build_checkpoint_document(state),
-            first_user_message=_fork_launch_message(text, normalized_lifecycle),
-            title=str(getattr(state, "_session_title", "") or ""),
+            source_document=source_doc,
+            first_user_message=launch_message,
+            title=title,
             spawn_policy="fork",
+            spawn_child=False,
         ),
-        tag="session_op",
+        tag="event_architecture_fork",
     )
+    _fork_ops(state)[op_id] = {
+        "stage": "fork_checkpoint",
+        "parent_session_id": session_id,
+        "lifecycle": normalized_lifecycle,
+        "first_user_message": launch_message,
+        "title": title,
+    }
     return (
         "Fork requested through the live session control path. "
         f"Lifecycle: {normalized_lifecycle}. Parent session: {session_id}. "
@@ -1217,6 +1541,7 @@ def register_features(builder, *, session, config):
         return
 
     components = [
+        ForkSessionCoordinator(config),
         fork_agent,
         suspend_session,
         subscribe_interrupt,
@@ -1228,5 +1553,6 @@ def register_features(builder, *, session, config):
         Feature(
             name="event_architecture",
             components=components,
+            order=[IoFence, ForkSessionCoordinator, Tool],
         )
     )
