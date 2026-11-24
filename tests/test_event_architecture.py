@@ -21,9 +21,9 @@ from agent_utils.features.core import IoFence, SchemaPublisher
 from agent_utils.runtime.simulation import SimOutcome, SimulationRuntime
 from agent_zoo.drivers.sessions import (
     SimSessionDriver,
-    _build_runtime_launch,
     serialize_artifact,
 )
+from agent_zoo.drivers.sessions.live import _build_runtime_launch
 from agent_zoo.events import (
     EmitNotice,
     ForkSessionOp,
