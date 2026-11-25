@@ -14,6 +14,7 @@ import signal
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 import uuid
 
@@ -31,13 +32,16 @@ from agent_utils.core.tool import Tool, tool
 from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
 from agent_utils.features.interrupts import InterruptCheck
-from agent_zoo.core.feature_state import session_state
 from agent_zoo.durability import (
     PluginConfigStore,
     PluginStorage,
     QueuedWorkerDriver,
+    SessionContext,
     StoreUpdate,
+    build_checkpoint_document,
     file_lock,
+    session_context,
+    session_state,
 )
 from agent_zoo.events import (
     EmitNotice,
@@ -52,7 +56,6 @@ from agent_zoo.events import (
     SuspendRequested,
 )
 from agent_zoo.features.settings import Setting, SettingError
-from agent_zoo.features.turn import build_checkpoint_document
 
 
 DURABLE_STATE_KEY = "event_architecture"
@@ -135,7 +138,18 @@ def _get_session_cwd(state: Any) -> str:
 
 
 def _current_session_id(state: Any) -> str:
-    return str(session_state(state).session_id or "").strip()
+    return str(session_context(state).session_id or "").strip()
+
+
+def _resolve_session_context(state: Any, config: dict[str, Any] | None = None) -> SessionContext:
+    ctx = session_context(state)
+    if config and (not ctx.config_path or not ctx.config_sets):
+        cfg_ctx = session_context(SimpleNamespace(config=config))
+        if not ctx.config_path and cfg_ctx.config_path:
+            ctx.config_path = cfg_ctx.config_path
+        if not ctx.config_sets and cfg_ctx.config_sets:
+            ctx.config_sets = cfg_ctx.config_sets
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -1129,41 +1143,30 @@ def _build_fork_session_spec(
 ) -> SessionSpec:
     cfg = config if isinstance(config, dict) else getattr(state, "config", None)
     cfg = cfg if isinstance(cfg, dict) else {}
-    context = getattr(state, "_agent_zoo_context", None)
-    context = context if isinstance(context, dict) else {}
-    provenance = cfg.get("_runtime_launch") if isinstance(cfg.get("_runtime_launch"), dict) else {}
+    ctx = _resolve_session_context(state, cfg)
     llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
     pilot_cfg = cfg.get("pilot") if isinstance(cfg.get("pilot"), dict) else {}
-    smeta = session_state(state)
 
     project = (
         str(
-            context.get("project_name")
-            or smeta.project_name
+            ctx.project_name
             or cfg.get("project_name")
             or "default"
         ).strip()
         or "default"
     )
-    pipeline_key = (
-        str(
-            context.get("pipeline_key")
-            or getattr(state, "_pipeline_key", "")
-            or "default"
-        ).strip()
-        or "default"
-    )
+    pipeline_key = str(ctx.pipeline_key or "default").strip() or "default"
     return SessionSpec(
         project=project,
         workdir=_get_session_cwd(state),
         model=str(llm_cfg.get("default") or getattr(state, "active_model", "") or "").strip(),
         pipeline_key=pipeline_key,
         env_name=str(pilot_cfg.get("_env_name") or ""),
-        config_path=str(provenance.get("config_path") or ""),
-        config_sets=tuple(str(x) for x in (provenance.get("config_sets") or ())),
-        state_root=str(context.get("state_root") or ""),
-        store_root=str(context.get("project_store_root") or context.get("store_root") or ""),
-        local_state_root=str(getattr(state, "_persistence_local_root", "") or ""),
+        config_path=str(ctx.config_path or ""),
+        config_sets=tuple(ctx.config_sets or ()),
+        state_root=str(ctx.state_root or ""),
+        store_root=str(ctx.store_root or ""),
+        local_state_root=str(ctx.local_state_root or ""),
         kind="fork",
         title=str(title or "").strip() or f"fork {child_session_id[:8]}",
         description=str(description or "").strip()
@@ -1209,9 +1212,6 @@ class ForkSessionCoordinator:
     handles = (IoCompleted, IoFailed, SessionRestored)
     optional_reads = {
         "config",
-        "_agent_zoo_context",
-        "_pipeline_key",
-        "_persistence_local_root",
         "active_model",
         "cwd",
         "session_cwd",
