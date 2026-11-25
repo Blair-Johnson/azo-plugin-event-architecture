@@ -1838,3 +1838,169 @@ def register_features(builder, *, config):
             durable_state=EVENT_ARCHITECTURE_DURABLE_SPEC,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Hooks
+# ---------------------------------------------------------------------------
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register deterministic in-memory simulation handlers for ``SyncCommandWatches``."""
+    from agent_utils.runtime.simulation import SimOutcome
+
+    watch_state: dict[str, Any] = {"generation": 0, "session_id": ""}
+
+    def _handle_sync_watches(
+        _op_id: OpId,
+        req: SyncCommandWatches,
+        _sim: Any,
+    ) -> SimOutcome:
+        delay = rng.uniform(0.01, 0.04)
+        if req.cleanup:
+            watch_state["generation"] += 1
+            watch_state["session_id"] = ""
+            return SimOutcome(
+                value={
+                    "generation": watch_state["generation"],
+                    "session_id": "",
+                    "cleaned": True,
+                },
+                delay=delay,
+            )
+        if req.session_id != watch_state["session_id"]:
+            watch_state["session_id"] = req.session_id
+            watch_state["generation"] += 1
+        gen = watch_state["generation"]
+        if req.subscriptions and rng.random() < 0.45:
+            # Preserve dict insertion order so selection is deterministic even
+            # when subscription IDs are random UUIDs.
+            import sys as _sys
+
+            req_mod = _sys.modules.get(type(req).__module__)
+            obs_cls = getattr(req_mod, "CommandObservation", CommandObservation)
+            trig_cls = getattr(req_mod, "CommandWatchTriggered", CommandWatchTriggered)
+            items = list(req.subscriptions.items())
+            sub_id, spec = items[rng.randrange(len(items))]
+            obs_delay = delay + rng.uniform(0.02, 0.10)
+            stdout = rng.choice(["READY ok\n", "status=healthy\n", "idle\n"])
+            obs = obs_cls(
+                subscription_id=sub_id,
+                revision=str(spec.get("revision") or ""),
+                completed_at=float(_sim.now) + obs_delay,
+                stdout=stdout,
+                stderr="",
+                returncode=0,
+                error="",
+                session_id=req.session_id,
+                generation=gen,
+            )
+            _sim.inject(
+                trig_cls(observation=obs, generation=gen),
+                delay=obs_delay,
+            )
+        return SimOutcome(
+            value={
+                "generation": gen,
+                "session_id": req.session_id,
+                "cleaned": False,
+            },
+            delay=delay,
+        )
+
+    import sys as _sys
+
+    sim.register_handler(SyncCommandWatches, _handle_sync_watches)
+    live_cls = getattr(_sys.modules.get(__name__), "SyncCommandWatches", None)
+    if isinstance(live_cls, type) and live_cls is not SyncCommandWatches:
+        sim.register_handler(live_cls, _handle_sync_watches)
+
+
+def fuzz_tool_args(tool_name: str, rng: Any, state: State) -> dict[str, Any] | None:
+    """Provide state-aware deterministic arguments for event-architecture tools."""
+    durable = state.features.get(DURABLE_STATE_KEY)
+    current_sid = _current_session_id(state)
+    owned: list[tuple[str, dict[str, Any]]] = []
+    if (
+        isinstance(durable, EventArchitectureState)
+        or type(durable).__name__ == "EventArchitectureState"
+    ) and current_sid:
+        owned = sorted(
+            (
+                (sub_id, spec)
+                for sub_id, spec in durable.subscriptions.items()
+                if str(spec.get("owner_session_id") or "") == current_sid
+            ),
+            key=lambda item: str(item[1].get("name") or ""),
+        )
+
+    if tool_name == "subscribe_interrupt":
+        existing_names = {str(spec.get("name") or "") for _, spec in owned}
+        base_idx = len(owned) + 1
+        name = f"watch_{base_idx}_{rng.randint(1, 999)}"
+        if existing_names and rng.random() < 0.10:
+            name = sorted(existing_names)[0]
+        return {
+            "name": name,
+            "command": rng.choice(["echo READY", "echo status=healthy", "printf idle"]),
+            "match_regex": rng.choice(["READY", "healthy", "status="]),
+            "interval_seconds": rng.choice([1.0, 5.0, 15.0]),
+            "trigger": rng.choice(["rising", "change", "each"]),
+            "timeout_seconds": rng.choice([1.0, 5.0]),
+            "match_stream": rng.choice(["stdout", "stderr", "both"]),
+            "fire_initial": rng.choice([True, False]),
+            "wake_on_error": rng.choice([True, False]),
+            "cwd": "" if rng.random() < 0.85 else rng.choice(["/workspace", "/workspace/app.py"]),
+        }
+
+    if tool_name == "remove_interrupt_subscription":
+        if owned and rng.random() < 0.85:
+            sub_id, spec = owned[rng.randrange(len(owned))]
+            return {
+                "subscription": sub_id if rng.random() < 0.5 else str(spec.get("name") or sub_id),
+            }
+        return {"subscription": f"missing_watch_{rng.randint(1, 99)}"}
+
+    if tool_name == "list_interrupt_subscriptions":
+        return {}
+
+    if tool_name == "fork_agent":
+        return {
+            "message": f"Monitor background task {rng.randint(1, 99)}",
+            "lifecycle": rng.choice(["persistent", "ephemeral"]),
+        }
+
+    return None
+
+
+def check_invariants(session: Any) -> None:
+    """Verify structural invariants on durable and ephemeral event-architecture state."""
+    state = session.state
+    durable = state.features.get(DURABLE_STATE_KEY)
+    if isinstance(durable, EventArchitectureState) or type(durable).__name__ == "EventArchitectureState":
+        assert isinstance(durable.subscriptions, dict), "subscriptions must be a dict"
+        assert isinstance(durable.suspend_confirmation_pending, bool)
+        assert durable.fork_lifecycle in ("", *VALID_FORK_LIFECYCLES), (
+            f"invalid fork_lifecycle: {durable.fork_lifecycle!r}"
+        )
+        for sub_id, spec in durable.subscriptions.items():
+            assert isinstance(sub_id, str) and sub_id, f"invalid subscription key: {sub_id!r}"
+            assert isinstance(spec, dict), f"subscription {sub_id!r} spec must be a dict"
+            assert spec.get("id") == sub_id, f"subscription id mismatch for {sub_id!r}"
+            assert spec.get("trigger") in VALID_TRIGGERS, (
+                f"invalid trigger {spec.get('trigger')!r} on {sub_id!r}"
+            )
+            assert spec.get("match_stream", "stdout") in {"stdout", "stderr", "both"}, (
+                f"invalid match_stream {spec.get('match_stream')!r} on {sub_id!r}"
+            )
+            assert isinstance(spec.get("name"), str) and spec["name"].strip()
+            assert isinstance(spec.get("command"), str) and spec["command"].strip()
+            assert float(spec.get("interval_seconds", 0.0)) >= MIN_INTERVAL_SECONDS
+
+    rt = state.runtime(RUNTIME_STATE_KEY) if callable(getattr(state, "runtime", None)) else None
+    if isinstance(rt, EventArchitectureRuntime) or type(rt).__name__ == "EventArchitectureRuntime":
+        assert rt.driver_generation >= 0, f"negative driver_generation: {rt.driver_generation}"
+        assert isinstance(rt.sync_op_ids, set)
+        assert isinstance(rt.fork_ops, dict)
+        assert all(isinstance(op_id, str) and op_id for op_id in rt.sync_op_ids)
+        assert all(isinstance(op_id, str) and op_id for op_id in rt.fork_ops)
