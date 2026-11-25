@@ -53,7 +53,7 @@ def build_dispatcher(config=None, session=None):
     dispatcher = SettingsDispatcher(config=config or {})
     builder = PipelineBuilder()
     builder.add(Feature("test_settings_dispatcher", components=[dispatcher], order=[SettingsDispatcher, Setting]))
-    plugin.register_features(builder, session=session, config=config or {})
+    plugin.register_features(builder, config=config or {})
     pipeline = builder.build()
     pipeline.init_state(session.state)
     settings = [component for component in pipeline.components if isinstance(component, Setting)]
@@ -133,9 +133,8 @@ def test_disabled_registration_round_trip(settings_file, tmp_path):
     assert stat.S_IMODE(settings_file.stat().st_mode) == 0o640
     # The existing builder is not live-mutated by a reload-scoped setting.
     assert not builder.has("event_architecture")
-    fresh_session = Session(state=State())
     fresh = PipelineBuilder()
-    plugin.register_features(fresh, session=fresh_session, config={})
+    plugin.register_features(fresh, config={})
     assert fresh.has("event_architecture")
     assert list_rows(dispatcher, session.state)[0]["value"] is True
     # Only the config file (and advisory lock file) exist; no leaked temp files.

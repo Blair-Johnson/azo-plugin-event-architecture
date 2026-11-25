@@ -144,7 +144,7 @@ def test_static_and_pipeline_sans_io_audit(plugin, tmp_path):
         include_plugins=False,
         include_llm_drivers=False,
     )
-    plugin.register_features(builder, session=session, config=config)
+    plugin.register_features(builder, config=config)
     pipeline = builder.build()
     pipeline.init_state(session.state)
     built_drivers = builder.build_drivers()
@@ -258,7 +258,7 @@ def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path)
 
     builder = PipelineBuilder()
     builder.add(Feature("test_core", components=[IoFence()], order=[IoFence, Tool]))
-    plugin.register_features(builder, session=session, config=config)
+    plugin.register_features(builder, config=config)
     builder.add(
         Feature(
             "test_order",
@@ -925,17 +925,25 @@ def registration_session(
 
 
 def test_register_features_is_disabled_by_default_and_does_not_mutate_env(plugin, monkeypatch):
+    # Without FORK_ENABLE_ENV or explicit config, only settings are registered.
+    builder_clean = Builder()
+    plugin.register_features(builder_clean, config={})
+    assert [feature.name for feature in builder_clean.features] == ["event_architecture_settings"]
+
+    # With unrelated FORK_ENABLE_ENV, env is not mutated and all tools stay gated off for non-forks.
     builder = Builder()
     monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "unrelated-parent")
+    plugin.register_features(builder, config={})
 
-    plugin.register_features(
-        builder,
-        session=registration_session("root-session"),
-        config={},
-    )
-
-    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
     assert plugin.os.environ.get(plugin.FORK_ENABLE_ENV) == "unrelated-parent"
+    assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
+    root_state = registration_session("root-session").state
+    components = builder.features[1].components
+    tools = [c for c in components if isinstance(c, Tool)]
+    assert tools
+    assert all(not t.available(root_state) for t in tools)
+    publish_schemas(components, root_state)
+    assert all(schema["available"] is False for schema in root_state.tool_schemas.values())
 
 
 def test_installed_config_enables_tools_in_fresh_session(plugin, monkeypatch, tmp_path):
@@ -947,11 +955,7 @@ def test_installed_config_enables_tools_in_fresh_session(plugin, monkeypatch, tm
     monkeypatch.setenv(plugin.CONFIG_PATH_ENV, str(config_path))
     builder = Builder()
 
-    plugin.register_features(
-        builder,
-        session=registration_session("root-session"),
-        config={},
-    )
+    plugin.register_features(builder, config={})
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
 
@@ -965,11 +969,7 @@ def test_installed_config_can_disable_tools(plugin, monkeypatch, tmp_path):
     monkeypatch.setenv(plugin.CONFIG_PATH_ENV, str(config_path))
     builder = Builder()
 
-    plugin.register_features(
-        builder,
-        session=registration_session("root-session"),
-        config={},
-    )
+    plugin.register_features(builder, config={})
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
 
@@ -985,7 +985,6 @@ def test_explicit_config_overrides_installed_config(plugin, monkeypatch, tmp_pat
 
     plugin.register_features(
         builder,
-        session=registration_session("root-session"),
         config={"event_architecture": {"enabled": False}},
     )
 
@@ -997,7 +996,6 @@ def test_register_features_adds_tools_driver_and_durable_spec_when_enabled(plugi
     monkeypatch.delenv(plugin.FORK_ENABLE_ENV, raising=False)
     plugin.register_features(
         builder,
-        session=registration_session("root-session"),
         config={"event_architecture": {"enabled": True}},
     )
 
@@ -1030,7 +1028,7 @@ def test_ephemeral_fork_registration_adds_suspend_tool(plugin, monkeypatch):
     )
     authorize_ephemeral_fork(plugin, session.state)
 
-    plugin.register_features(builder, session=session, config={})
+    plugin.register_features(builder, config={})
 
     components = builder.features[1].components
     tool_names = {
@@ -1051,7 +1049,7 @@ def test_persistent_fork_registration_gates_suspend_tool(plugin, monkeypatch):
         parent_session_id="parent-session",
     )
 
-    plugin.register_features(builder, session=session, config={})
+    plugin.register_features(builder, config={})
 
     components = builder.features[1].components
     tool_names = {
@@ -1070,7 +1068,6 @@ def test_nonfork_registration_gates_suspend_tool(plugin, monkeypatch):
 
     plugin.register_features(
         builder,
-        session=session,
         config={"event_architecture": {"enabled": True}},
     )
 
@@ -1091,7 +1088,6 @@ def test_suspend_tool_becomes_available_after_fork_state_is_restored(plugin, mon
 
     plugin.register_features(
         builder,
-        session=session,
         config={"event_architecture": {"enabled": True}},
     )
 
@@ -1115,10 +1111,40 @@ def test_fork_session_inherits_launch_enablement_without_mutating_env(plugin, mo
         parent_session_id="parent-session",
     )
 
-    plugin.register_features(builder, session=session, config={})
+    plugin.register_features(builder, config={})
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
     assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "parent-session"
+    components = builder.features[1].components
+    publish_schemas(components, session.state)
+    assert session.state.tool_schemas["fork_agent"]["available"] is True
+    assert session.state.tool_schemas["subscribe_interrupt"]["available"] is True
+
+
+def test_load_fork_session_into_initially_nonfork_session_enables_tools(plugin, monkeypatch):
+    builder = Builder()
+    monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent-session")
+    plugin.register_features(builder, config={})
+    components = builder.features[1].components
+
+    # Initially a non-fork session: all tools are gated off.
+    state = make_state("root-session")
+    publish_schemas(components, state)
+    assert all(entry["available"] is False for entry in state.tool_schemas.values())
+
+    # Simulate /load restoring an ephemeral fork session from parent-session.
+    smeta = session_state(state)
+    smeta.session_id = "child-session"
+    smeta.kind = "fork"
+    smeta.parent_session_id = "parent-session"
+    authorize_ephemeral_fork(plugin, state)
+    check = next(c for c in components if isinstance(c, plugin.CommandWatchCheck))
+    check.handle(SessionRestored(), state, lambda _ev: None)
+    publish_schemas(components, state)
+
+    assert state.tool_schemas["fork_agent"]["available"] is True
+    assert state.tool_schemas["suspend_session"]["available"] is True
+    assert state.tool_schemas["subscribe_interrupt"]["available"] is True
 
 
 def test_fork_session_rejects_other_lineage_marker(plugin, monkeypatch):
@@ -1130,23 +1156,23 @@ def test_fork_session_rejects_other_lineage_marker(plugin, monkeypatch):
         parent_session_id="parent-session",
     )
 
-    plugin.register_features(builder, session=session, config={})
+    plugin.register_features(builder, config={})
 
-    assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
+    components = builder.features[1].components
+    publish_schemas(components, session.state)
+    assert all(entry["available"] is False for entry in session.state.tool_schemas.values())
+    fork_tool = next(c for c in components if getattr(c, "name", "") == "fork_agent")
+    tc = call_tool(fork_tool, session.state, message="should be blocked")
+    assert tc.error is True
+    assert "not currently available" in (tc.result or "")
 
 
 def test_explicit_false_disables_fork_inheritance(plugin, monkeypatch):
     builder = Builder()
     monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent-session")
-    session = registration_session(
-        "child-session",
-        kind="fork",
-        parent_session_id="parent-session",
-    )
 
     plugin.register_features(
         builder,
-        session=session,
         config={"event_architecture": {"enabled": False}},
     )
 
@@ -1389,3 +1415,51 @@ def test_replacement_waits_for_cancelled_generation_to_exit(
 
     reactor.cleanup()
     assert [observation.revision for observation in observations] == ["new"]
+
+
+def test_command_watch_driver_quiesce_cancels_queued_sync_without_respawning(plugin, monkeypatch):
+    driver = plugin.CommandWatchDriver()
+    assert driver.cancel_queued_on_close is True
+
+    entered = threading.Event()
+    release = threading.Event()
+    synced_sessions: list[str] = []
+    cleanup_calls = 0
+    real_cleanup = driver._reactor.cleanup
+
+    def fake_sync(session_id, specs):
+        synced_sessions.append(session_id)
+        if session_id == "first":
+            entered.set()
+            release.wait(timeout=3.0)
+        return len(synced_sessions)
+
+    def counting_cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        real_cleanup()
+
+    monkeypatch.setattr(driver._reactor, "sync", fake_sync)
+    monkeypatch.setattr(driver._reactor, "cleanup", counting_cleanup)
+
+    driver.start(lambda _ev: None)
+    try:
+        driver.submit("op-1", plugin.SyncCommandWatches(session_id="first", subscriptions={}))
+        assert entered.wait(timeout=2.0)
+        # Queue a second sync while op-1 is in flight; quiesce must cancel it before cleanup.
+        driver.submit("op-2", plugin.SyncCommandWatches(session_id="second", subscriptions={"w": {}}))
+        quiesce_thread = threading.Thread(
+            target=lambda: driver.quiesce(policy="terminate", deadline=time.monotonic() + 2.0)
+        )
+        quiesce_thread.start()
+        time.sleep(0.05)
+        release.set()
+        quiesce_thread.join(timeout=3.0)
+        assert not quiesce_thread.is_alive()
+        assert synced_sessions == ["first"]
+        assert cleanup_calls == 1
+    finally:
+        release.set()
+        driver.close()
+    # close() runs on_close() cleanup once (not twice).
+    assert cleanup_calls == 2

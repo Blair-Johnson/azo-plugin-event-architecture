@@ -14,7 +14,6 @@ import signal
 import subprocess
 import threading
 import time
-from types import SimpleNamespace
 from typing import Any
 import uuid
 
@@ -33,14 +32,13 @@ from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
 from agent_utils.features.interrupts import InterruptCheck
 from agent_zoo.durability import (
+    PluginConfigBox,
     PluginConfigStore,
     PluginStorage,
     QueuedWorkerDriver,
-    SessionContext,
-    StoreUpdate,
     build_checkpoint_document,
-    file_lock,
     session_context,
+    session_cwd,
     session_state,
 )
 from agent_zoo.events import (
@@ -128,28 +126,20 @@ def _event_runtime(state: Any) -> EventArchitectureRuntime:
     return state.runtime(RUNTIME_STATE_KEY, EventArchitectureRuntime)
 
 
-def _get_session_cwd(state: Any) -> str:
-    return str(
-        getattr(state, "cwd", "")
-        or getattr(state, "session_cwd", "")
-        or getattr(state, "terminal_cwd", "")
-        or ""
-    ).strip()
-
-
 def _current_session_id(state: Any) -> str:
     return str(session_context(state).session_id or "").strip()
 
 
-def _resolve_session_context(state: Any, config: dict[str, Any] | None = None) -> SessionContext:
-    ctx = session_context(state)
-    if config and (not ctx.config_path or not ctx.config_sets):
-        cfg_ctx = session_context(SimpleNamespace(config=config))
-        if not ctx.config_path and cfg_ctx.config_path:
-            ctx.config_path = cfg_ctx.config_path
-        if not ctx.config_sets and cfg_ctx.config_sets:
-            ctx.config_sets = cfg_ctx.config_sets
-    return ctx
+def _fork_lineage_matches(state: Any, inherited_parent_id: str) -> bool:
+    if not inherited_parent_id:
+        return True
+    if state is None:
+        return False
+    smeta = session_state(state)
+    return (
+        str(smeta.kind or "").strip().lower() == "fork"
+        and str(smeta.parent_session_id or "").strip() == inherited_parent_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +487,7 @@ class CommandWatchDriver(QueuedWorkerDriver):
     request_types = (SyncCommandWatches,)
     durability = "process_bound"
     worker_name = "azo-command-watch-driver"
+    cancel_queued_on_close = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -523,19 +514,10 @@ class CommandWatchDriver(QueuedWorkerDriver):
         policy: str = "terminate",
         deadline: float | None = None,
     ) -> list[Event]:
-        del policy, deadline
+        self.cancel_pending()
+        events = super().quiesce(policy=policy, deadline=deadline)
         self._reactor.cleanup()
-        return []
-
-    def close(self) -> None:
-        with self._cond:
-            self._closing = True
-            for op_id, _ in self._queue:
-                self._cancelled.add(op_id)
-            self._queue.clear()
-            self._cond.notify_all()
-        self._reactor.cleanup()
-        super().close()
+        return events
 
     def on_close(self) -> None:
         self._reactor.cleanup()
@@ -967,6 +949,10 @@ class CommandWatchCheck(InterruptCheck):
     optional_reads = set()
     writes = set()
 
+    def __init__(self, *, inherited_parent_id: str = "") -> None:
+        super().__init__()
+        self._inherited_parent_id = inherited_parent_id
+
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         del emit
         if isinstance(event, ShutdownRequested):
@@ -979,6 +965,8 @@ class CommandWatchCheck(InterruptCheck):
             rt.pending_suspend = False
             rt.sync_op_ids.clear()
             rt.last_synced_signature = None
+            if not _fork_lineage_matches(state, self._inherited_parent_id):
+                return
             _submit_watch_sync(state, force=True, hold_readiness="event_architecture")
             return
 
@@ -991,6 +979,9 @@ class CommandWatchCheck(InterruptCheck):
                 gen = int(event.value.get("generation") or 0)
                 if gen > rt.driver_generation:
                     rt.driver_generation = gen
+            return
+
+        if not _fork_lineage_matches(state, self._inherited_parent_id):
             return
 
         if isinstance(event, TurnSettled):
@@ -1143,7 +1134,7 @@ def _build_fork_session_spec(
 ) -> SessionSpec:
     cfg = config if isinstance(config, dict) else getattr(state, "config", None)
     cfg = cfg if isinstance(cfg, dict) else {}
-    ctx = _resolve_session_context(state, cfg)
+    ctx = session_context(state, config=cfg)
     llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
     pilot_cfg = cfg.get("pilot") if isinstance(cfg.get("pilot"), dict) else {}
 
@@ -1158,7 +1149,7 @@ def _build_fork_session_spec(
     pipeline_key = str(ctx.pipeline_key or "default").strip() or "default"
     return SessionSpec(
         project=project,
-        workdir=_get_session_cwd(state),
+        workdir=session_cwd(state),
         model=str(llm_cfg.get("default") or getattr(state, "active_model", "") or "").strip(),
         pipeline_key=pipeline_key,
         env_name=str(pilot_cfg.get("_env_name") or ""),
@@ -1219,14 +1210,22 @@ class ForkSessionCoordinator:
     }
     writes = set()
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        inherited_parent_id: str = "",
+    ) -> None:
         self.config = config if isinstance(config, dict) else None
+        self._inherited_parent_id = inherited_parent_id
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if isinstance(event, SessionRestored):
             _fork_ops(state).clear()
             return
         if not isinstance(event, (IoCompleted, IoFailed)):
+            return
+        if not _fork_lineage_matches(state, self._inherited_parent_id):
             return
         ops = _fork_ops(state)
         if event.op_id not in ops:
@@ -1451,8 +1450,13 @@ class EphemeralSuspendHook:
         "shutdown_spawned_policy",
     }
 
+    def __init__(self, *, inherited_parent_id: str = "") -> None:
+        self._inherited_parent_id = inherited_parent_id
+
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if not isinstance(event, TurnSettled):
+            return
+        if not _fork_lineage_matches(state, self._inherited_parent_id):
             return
         rt = _event_runtime(state)
         if not rt.pending_suspend:
@@ -1542,7 +1546,7 @@ def subscribe_interrupt(
         raise ValueError(f"subscription name already exists: {clean_name}")
 
     raw_cwd = str(cwd or "").strip()
-    resolved_cwd = resolve_session_path(raw_cwd, state) if raw_cwd else _get_session_cwd(state)
+    resolved_cwd = resolve_session_path(raw_cwd, state) if raw_cwd else session_cwd(state)
     if not resolved_cwd:
         raise ValueError("cwd is required when session has no working directory")
 
@@ -1627,18 +1631,10 @@ def remove_interrupt_subscription(subscription: str, state=None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Host Build-Time Config Loading & Pure Sans-I/O Settings Box
+# Host Build-Time Config Loading & Pure Sans-I/O Settings via PluginConfigBox
 # ---------------------------------------------------------------------------
 
-
-@dataclass
-class _SettingsBox:
-    """In-memory snapshot of plugin configuration loaded once at host build time."""
-
-    enabled: bool = False
-    has_explicit_enabled: bool = False
-    load_error: str = ""
-    config_filename: str = CONFIG_REL_PATH
+_CONFIG_LOAD_ERROR = "Cannot read plugin configuration"
 
 
 def _plugin_storage(*, state_root: str | Path | None = None) -> PluginStorage:
@@ -1670,86 +1666,105 @@ def _configured_enablement(config: Any) -> bool | None:
     return value is True
 
 
-def _read_config_strict(store: PluginConfigStore) -> tuple[dict[str, Any], str]:
-    """Read plugin config under cross-process lock without overwriting malformed files."""
-    path = store.path
-    if not path.exists():
-        return {}, ""
-    try:
-        with file_lock(store.lock_path, shared=True):
-            raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return {}, "Cannot read plugin configuration"
-    try:
-        document = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}, "Cannot read plugin configuration"
+def _validate_config_doc(document: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(document, dict):
-        return {}, "Plugin configuration must be an object"
+        raise ValueError("Plugin configuration must be an object")
     if "event_architecture" in document and not isinstance(document["event_architecture"], dict):
-        return {}, "Plugin configuration section must be an object"
-    return document, ""
+        raise ValueError("Plugin configuration section must be an object")
+    return document
 
 
-def _load_settings_box(*, state_root: str | Path | None = None) -> _SettingsBox:
+def _load_config_box(*, state_root: str | Path | None = None) -> PluginConfigBox:
     store = _plugin_config_store(state_root=state_root)
-    document, err = _read_config_strict(store)
-    if err:
-        return _SettingsBox(enabled=False, has_explicit_enabled=False, load_error=err)
-    configured = _configured_enablement(document)
-    return _SettingsBox(
-        enabled=(configured is True),
-        has_explicit_enabled=(configured is not None),
-        load_error="",
+    box = PluginConfigBox(
+        PLUGIN_NAME,
         config_filename=CONFIG_REL_PATH,
+        state_root=state_root,
+        validate=_validate_config_doc,
+        store=store,
     )
+    if box.load_error is None and box.path.is_file():
+        try:
+            if not box.path.read_text(encoding="utf-8").strip():
+                box.load_error = _CONFIG_LOAD_ERROR
+        except OSError:
+            box.load_error = _CONFIG_LOAD_ERROR
+    elif box.load_error is not None:
+        box.load_error = _CONFIG_LOAD_ERROR
+    return box
+
+
+def _registration_mode(
+    config: Any,
+    *,
+    config_box: PluginConfigBox | None = None,
+) -> tuple[bool, str]:
+    """Return ``(should_register, inherited_parent_id)`` without inspecting session state."""
+    explicit = _configured_enablement(config)
+    if explicit is not None:
+        return explicit, ""
+    box = config_box if config_box is not None else _load_config_box()
+    if box.load_error is None:
+        saved = _configured_enablement(box.data)
+        if saved is not None:
+            return saved, ""
+    inherited_parent_id = str(os.environ.get(FORK_ENABLE_ENV, "") or "").strip()
+    if inherited_parent_id:
+        return True, inherited_parent_id
+    return False, ""
 
 
 def _plugin_enabled(
     config: Any,
-    session: Any,
+    session: Any = None,
     *,
-    settings_box: _SettingsBox | None = None,
+    config_box: PluginConfigBox | None = None,
 ) -> bool:
-    explicit = _configured_enablement(config)
-    if explicit is not None:
-        return explicit
-    box = settings_box if settings_box is not None else _load_settings_box()
-    if box.has_explicit_enabled:
-        return box.enabled
-    state = getattr(session, "state", None)
-    if state is None:
+    should_register, inherited_parent_id = _registration_mode(config, config_box=config_box)
+    if not should_register:
         return False
-    smeta = session_state(state)
-    session_kind = str(smeta.kind or "").strip().lower()
-    parent_session_id = str(smeta.parent_session_id or "").strip()
-    inherited_parent_id = str(os.environ.get(FORK_ENABLE_ENV, "") or "").strip()
-    return (
-        session_kind == "fork"
-        and bool(parent_session_id)
-        and inherited_parent_id == parent_session_id
-    )
+    if not inherited_parent_id or session is None:
+        return True
+    return _fork_lineage_matches(getattr(session, "state", None), inherited_parent_id)
 
 
-def _register_settings(builder: Any, box: _SettingsBox) -> None:
+class _GatedTool(Tool):
+    """Wrap a ``Tool`` with a per-state fork-lineage gate for dynamic ``/load`` support."""
+
+    def __init__(self, inner: Tool, *, inherited_parent_id: str) -> None:
+        self._inner = inner
+        self._inherited_parent_id = inherited_parent_id
+        self.name = inner.name
+        self.description = inner.description
+        self.schema = inner.schema
+        self.io_tag = inner.io_tag
+        self.reads = set(inner.reads)
+        self.writes = set(inner.writes)
+        self.optional_reads = set(inner.optional_reads)
+        self.init = dict(inner.init)
+        if hasattr(inner, "fn"):
+            self.fn = inner.fn
+            self._fn_wants_state = getattr(inner, "_fn_wants_state", False)
+
+    def available(self, state: State) -> bool:
+        return (
+            _fork_lineage_matches(state, self._inherited_parent_id)
+            and self._inner.available(state)
+        )
+
+    def call(self, state: State, **kwargs: Any) -> Any:
+        return self._inner.call(state, **kwargs)
+
+
+def _register_settings(builder: Any, box: PluginConfigBox) -> None:
     def get_enabled(_ctx: Any) -> bool:
-        if box.load_error:
-            raise SettingError(box.load_error)
-        return bool(box.enabled)
+        doc = box.require_loaded()
+        return _configured_enablement(doc) is True
 
     def set_enabled(ctx: Any, value: Any) -> None:
-        if box.load_error:
-            raise SettingError(box.load_error)
+        box.require_loaded()
         if type(value) is not bool:
             raise SettingError("Expected a boolean")
-        previous = box.enabled
-        previous_explicit = box.has_explicit_enabled
-        box.enabled = value
-        box.has_explicit_enabled = True
-
-        def _rollback() -> None:
-            box.enabled = previous
-            box.has_explicit_enabled = previous_explicit
 
         def _updater(current: dict[str, Any]) -> dict[str, Any]:
             doc = dict(current) if isinstance(current, dict) else {}
@@ -1761,15 +1776,7 @@ def _register_settings(builder: Any, box: _SettingsBox) -> None:
             doc["event_architecture"] = updated_section
             return doc
 
-        ctx.submit_persist_io(
-            StoreUpdate(
-                plugin=PLUGIN_NAME,
-                scope="config",
-                config_filename=box.config_filename,
-                updater=_updater,
-            ),
-            rollback=_rollback,
-        )
+        box.mutate(ctx, _updater, tag="event_architecture.config")
 
     builder.add(
         Feature(
@@ -1795,22 +1802,32 @@ def _register_settings(builder: Any, box: _SettingsBox) -> None:
     )
 
 
-def register_features(builder, *, session, config):
-    """Register model tools only when explicitly enabled or inherited by a fork."""
-    box = _load_settings_box()
+def register_features(builder, *, config):
+    """Register model tools when enabled or eligible for fork inheritance (no session capture)."""
+    box = _load_config_box()
     _register_settings(builder, box)
-    if not _plugin_enabled(config, session, settings_box=box):
+    should_register, inherited_parent_id = _registration_mode(config, config_box=box)
+    if not should_register:
         return
 
-    components = [
-        ForkSessionCoordinator(config),
+    base_tools: list[Tool] = [
         fork_agent,
         suspend_session,
-        EphemeralSuspendHook(),
         subscribe_interrupt,
         list_interrupt_subscriptions,
         remove_interrupt_subscription,
-        CommandWatchCheck(),
+    ]
+    tools: list[Tool] = (
+        [_GatedTool(t, inherited_parent_id=inherited_parent_id) for t in base_tools]
+        if inherited_parent_id
+        else base_tools
+    )
+    components = [
+        ForkSessionCoordinator(config, inherited_parent_id=inherited_parent_id),
+        *tools[:2],
+        EphemeralSuspendHook(inherited_parent_id=inherited_parent_id),
+        *tools[2:],
+        CommandWatchCheck(inherited_parent_id=inherited_parent_id),
     ]
     builder.add(
         Feature(
