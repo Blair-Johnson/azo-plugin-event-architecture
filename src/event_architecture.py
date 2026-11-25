@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -32,11 +31,11 @@ from agent_utils.core.tool import Tool, tool
 from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
 from agent_utils.features.interrupts import InterruptCheck
-from agent_utils.runtime.driver import Driver
 from agent_zoo.core.feature_state import session_state
 from agent_zoo.durability import (
     PluginConfigStore,
     PluginStorage,
+    QueuedWorkerDriver,
     StoreUpdate,
     file_lock,
 )
@@ -478,29 +477,16 @@ class CommandWatchReactor:
             pass
 
 
-class CommandWatchDriver(Driver):
+class CommandWatchDriver(QueuedWorkerDriver):
     """Process-bound driver owning ``CommandWatchReactor`` and pushing watch events."""
 
     request_types = (SyncCommandWatches,)
     durability = "process_bound"
+    worker_name = "azo-command-watch-driver"
 
     def __init__(self) -> None:
         super().__init__()
         self._reactor = CommandWatchReactor(on_observation=self._on_observation)
-        self._cond = threading.Condition(threading.RLock())
-        self._executor: ThreadPoolExecutor | None = None
-        self._futures: dict[OpId, Future[Any]] = {}
-        self._cancelled: set[OpId] = set()
-        self._closing = False
-        self._closed = False
-
-    def _ensure_executor_locked(self) -> ThreadPoolExecutor:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="azo-command-watch-driver",
-            )
-        return self._executor
 
     def _on_observation(self, observation: CommandObservation) -> None:
         with self._cond:
@@ -513,33 +499,9 @@ class CommandWatchDriver(Driver):
             )
         )
 
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
+    def is_fenced(self, op_id: OpId) -> bool:
         with self._cond:
-            self._closing = False
-            self._closed = False
-            self._ensure_executor_locked()
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, SyncCommandWatches):
-            raise TypeError(
-                f"CommandWatchDriver expected SyncCommandWatches, got {type(req).__name__}"
-            )
-        with self._cond:
-            if self._closing or self._closed or op_id in self._cancelled:
-                return
-            executor = self._ensure_executor_locked()
-            fut = executor.submit(self._run_sync, op_id, req)
-            self._futures[op_id] = fut
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._cond:
-            self._cancelled.add(op_id)
-            fut = self._futures.get(op_id)
-            if fut is not None and fut.cancel():
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                self._cond.notify_all()
+            return self._closed or self._closing or op_id in self._cancelled
 
     def quiesce(
         self,
@@ -554,57 +516,34 @@ class CommandWatchDriver(Driver):
     def close(self) -> None:
         with self._cond:
             self._closing = True
-            executor = self._executor
-            for op_id, fut in list(self._futures.items()):
+            for op_id, _ in self._queue:
                 self._cancelled.add(op_id)
-                fut.cancel()
+            self._queue.clear()
             self._cond.notify_all()
         self._reactor.cleanup()
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-        with self._cond:
-            self._closed = True
-            self._executor = None
-            self._futures.clear()
-            self._cancelled.clear()
-            self._cond.notify_all()
+        super().close()
 
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._cond:
-            return self._closed or self._closing or op_id in self._cancelled
+    def on_close(self) -> None:
+        self._reactor.cleanup()
 
-    def _run_sync(self, op_id: OpId, req: SyncCommandWatches) -> None:
-        if self._is_fenced(op_id):
-            with self._cond:
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                self._cond.notify_all()
-            return
-        try:
-            if req.cleanup:
-                self._reactor.cleanup()
-                result = {
-                    "generation": self._reactor.current_generation,
-                    "session_id": "",
-                    "cleaned": True,
-                }
-            else:
-                generation = self._reactor.sync(req.session_id, req.subscriptions)
-                result = {
-                    "generation": generation,
-                    "session_id": req.session_id,
-                    "cleaned": False,
-                }
-            if not self._is_fenced(op_id):
-                self._safe_emit(IoCompleted(op_id=op_id, value=result))
-        except Exception as exc:
-            if not self._is_fenced(op_id):
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-        finally:
-            with self._cond:
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                self._cond.notify_all()
+    def execute(self, req: IoRequest) -> dict[str, Any]:
+        if not isinstance(req, SyncCommandWatches):
+            raise TypeError(
+                f"CommandWatchDriver expected SyncCommandWatches, got {type(req).__name__}"
+            )
+        if req.cleanup:
+            self._reactor.cleanup()
+            return {
+                "generation": self._reactor.current_generation,
+                "session_id": "",
+                "cleaned": True,
+            }
+        generation = self._reactor.sync(req.session_id, req.subscriptions)
+        return {
+            "generation": generation,
+            "session_id": req.session_id,
+            "cleaned": False,
+        }
 
 
 def _reactor_spec(spec: dict[str, Any]) -> dict[str, Any]:
@@ -816,6 +755,7 @@ def _submit_watch_sync(
     *,
     force: bool = False,
     cleanup: bool = False,
+    hold_readiness: str | bool | None = None,
 ) -> OpId | None:
     io_table = getattr(state, "io", None)
     if io_table is None:
@@ -843,6 +783,7 @@ def _submit_watch_sync(
     op_id = io_table.submit(
         SyncCommandWatches(session_id=session_id, subscriptions=specs, cleanup=False),
         tag="command_watch_sync",
+        hold_readiness=hold_readiness,
     )
     rt.sync_op_ids.add(op_id)
     return op_id
@@ -1024,7 +965,7 @@ class CommandWatchCheck(InterruptCheck):
             rt.pending_suspend = False
             rt.sync_op_ids.clear()
             rt.last_synced_signature = None
-            _submit_watch_sync(state, force=True)
+            _submit_watch_sync(state, force=True, hold_readiness="event_architecture")
             return
 
         if isinstance(event, (IoCompleted, IoFailed)):
