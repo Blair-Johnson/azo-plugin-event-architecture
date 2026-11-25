@@ -11,18 +11,25 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, RunToolCall, TurnSettled
-from agent_utils.core.io import SubmitOp
+from agent_utils.core.events import (
+    IoCompleted,
+    IoFailed,
+    RenderRequested,
+    RunToolCall,
+    SessionRestored,
+    SessionStarted,
+    TurnSettled,
+)
+from agent_utils.core.io import FsStat, SubmitOp
 from agent_utils.core.pipeline import Feature, PipelineBuilder
 from agent_utils.core.session import Session
 from agent_utils.core.state import Entry, State, ToolCall
 from agent_utils.core.tool import Tool
 from agent_utils.features.core import IoFence, SchemaPublisher
+from agent_utils.runtime.drivers.fs import FsStatResult
 from agent_utils.runtime.simulation import SimOutcome, SimulationRuntime
-from agent_zoo.drivers.sessions import (
-    SimSessionDriver,
-    serialize_artifact,
-)
+from agent_zoo.core.feature_state import session_state
+from agent_zoo.drivers.sessions import SimSessionDriver
 from agent_zoo.drivers.sessions.live import _build_runtime_launch
 from agent_zoo.events import (
     EmitNotice,
@@ -36,7 +43,9 @@ from agent_zoo.events import (
     SpawnSession,
     SuspendRequested,
 )
+from agent_zoo.pipelines.default import build_default_builder
 from agent_zoo.storage.store import CommitReceipt
+from agent_zoo.testing.sans_io_guard import assert_pipeline_sans_io, audit_module_sans_io
 
 
 PLUGIN_PATH = Path(__file__).parents[1] / "src" / "event_architecture.py"
@@ -53,27 +62,25 @@ def load_plugin():
 
 @pytest.fixture
 def plugin(monkeypatch, tmp_path):
-    monkeypatch.setenv(
-        "AZO_EVENT_ARCHITECTURE_CONFIG",
-        str(tmp_path / "missing-event-architecture.json"),
-    )
+    monkeypatch.setenv("AGENT_ZOO_STATE_ROOT", str(tmp_path / "state-root"))
+    monkeypatch.delenv("AZO_EVENT_ARCHITECTURE_CONFIG", raising=False)
+    monkeypatch.delenv("AZO_EVENT_ARCHITECTURE_FORK_ENABLED", raising=False)
     return load_plugin()
 
 
-def make_state(session_id: str = "session-a") -> State:
-    state = State()
-    state._session_id = session_id
-    state.run_db = SimpleNamespace(session_id=session_id)
+def make_state(session_id: str = "session-a", *, cwd: str = "") -> State:
+    state = State(cwd=cwd or str(Path.cwd()))
+    smeta = session_state(state)
+    smeta.session_id = session_id
     state.pending_tool_calls = []
     state.pending_interrupts = []
     state._interrupt_state = {}
     state.tool_schemas = {}
-    state.cwd = str(Path.cwd())
     return state
 
 
 def authorize_ephemeral_fork(plugin, state: State) -> None:
-    state._session_kind = "fork"
+    session_state(state).kind = "fork"
     state.entries.append(
         Entry(
             messages=[
@@ -88,7 +95,7 @@ def authorize_ephemeral_fork(plugin, state: State) -> None:
     )
 
 
-def call_tool(tool, state: State, **kwargs):
+def call_tool(tool, state: State, *, stat_result: FsStatResult | None = None, **kwargs):
     tc = ToolCall(
         id="call-1",
         name=tool.name,
@@ -98,6 +105,24 @@ def call_tool(tool, state: State, **kwargs):
     state.pending_tool_calls = [tc]
     emitted = []
     tool.handle(RunToolCall(tc), state, emitted.append)
+    if tc.waiting_op is not None:
+        # Drive FsStat generator tools in unit tests without touching real OS I/O.
+        outbox = state.io.take_outbox()
+        remaining = []
+        for eff in outbox:
+            if isinstance(eff, SubmitOp) and eff.op_id == tc.waiting_op and isinstance(eff.request, FsStat):
+                res = stat_result or FsStatResult(
+                    path=eff.request.path,
+                    exists=True,
+                    is_file=False,
+                    is_dir=True,
+                )
+                tool.handle(IoCompleted(op_id=eff.op_id, value=res), state, emitted.append)
+            else:
+                remaining.append(eff)
+        # Re-queue any non-FsStat effects (e.g. SyncCommandWatches) so caller can inspect them.
+        if remaining:
+            state.io._outbox.extend(remaining)
     state._emitted = emitted
     return tc
 
@@ -106,6 +131,31 @@ def publish_schemas(components, state: State) -> None:
     publisher = SchemaPublisher()
     publisher.bind_pipeline(tuple(components))
     publisher.handle(RenderRequested(), state, lambda _ev: None)
+
+
+def test_static_and_pipeline_sans_io_audit(plugin, tmp_path):
+    assert audit_module_sans_io(PLUGIN_PATH) == []
+
+    session = Session(state=make_state("root-session", cwd=str(tmp_path)))
+    config = {"event_architecture": {"enabled": True}}
+    builder = build_default_builder(
+        session,
+        config=config,
+        include_plugins=False,
+        include_llm_drivers=False,
+    )
+    plugin.register_features(builder, session=session, config=config)
+    pipeline = builder.build()
+    pipeline.init_state(session.state)
+    built_drivers = builder.build_drivers()
+    assert any(isinstance(d, plugin.CommandWatchDriver) for d in built_drivers)
+    assert plugin.DURABLE_STATE_KEY in pipeline.durable_specs
+    assert pipeline.durable_specs[plugin.DURABLE_STATE_KEY].on_fork == "reset"
+    assert_pipeline_sans_io(
+        pipeline,
+        session=session,
+        events=(SessionStarted(), SessionRestored(), RenderRequested(), TurnSettled()),
+    )
 
 
 def test_fork_agent_submits_fork_session_op(plugin):
@@ -124,8 +174,9 @@ def test_fork_agent_submits_fork_session_op(plugin):
     assert req.spawn_child is False
     assert req.first_user_message.startswith(f"{plugin.PERSISTENT_FORK_MARKER}\n")
     assert req.first_user_message.endswith("\n\nMonitor issues independently.")
-    assert effects[0].op_id in getattr(state, plugin.FORK_OPS_ATTR)
-    assert plugin.FORK_OPS_ATTR not in (req.source_document.get("attrs") or {})
+    assert effects[0].op_id in plugin._event_runtime(state).fork_ops
+    # Ephemeral runtime ops never leak into serialized checkpoint documents.
+    assert "fork_ops" not in json.dumps(req.source_document)
 
 
 def test_fork_agent_defaults_to_persistent_lifecycle(plugin):
@@ -176,10 +227,10 @@ def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path)
     }
     session = Session(cwd=str(tmp_path))
     state = session.state
-    state._session_id = "parent-session"
-    state.run_db = SimpleNamespace(session_id="parent-session")
-    state._project_name = "demo-project"
-    state._session_title = "Parent Work"
+    smeta = session_state(state)
+    smeta.session_id = "parent-session"
+    smeta.project_name = "demo-project"
+    smeta.title = "Parent Work"
     state._agent_zoo_context = {
         "project_name": "demo-project",
         "pipeline_key": "default",
@@ -212,7 +263,7 @@ def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path)
         Feature(
             "test_order",
             components=[_EventSpy()],
-            order=[plugin.ForkSessionCoordinator, _EventSpy, Tool, plugin.CommandWatchCheck],
+            order=[plugin.ForkSessionCoordinator, _EventSpy, Tool],
         )
     )
     session.pipeline = builder.build()
@@ -265,7 +316,6 @@ def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path)
     assert len(seen_forks) == 1
     assert seen_forks[0].spawn_child is False
     assert seen_forks[0].spawn_policy == "fork"
-    assert plugin.FORK_OPS_ATTR not in (seen_forks[0].source_document.get("attrs") or {})
 
     assert len(seen_spawns) == 1
     spawn = seen_spawns[0]
@@ -292,7 +342,6 @@ def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path)
     assert spawn.launch_metadata["fork_lifecycle"] == lifecycle
     assert spawn.launch_metadata["parent_session_id"] == "parent-session"
 
-    # Verify the SessionSpec + SessionSource build a valid RuntimeLaunch.
     launch = _build_runtime_launch(
         session_id=spawn.session_id,
         instance_id="runtime-inst-1",
@@ -323,7 +372,7 @@ def test_fork_agent_unified_session_driver_pipeline(plugin, lifecycle, tmp_path)
         for ev in seen_notices
     )
     assert len(seen_projections) >= 1
-    assert getattr(state, plugin.FORK_OPS_ATTR) == {}
+    assert plugin._event_runtime(state).fork_ops == {}
 
 
 def test_fork_session_coordinator_handles_fork_and_spawn_failures(plugin):
@@ -389,26 +438,28 @@ def test_fork_session_coordinator_handles_fork_and_spawn_failures(plugin):
     assert any(isinstance(ev, ProjectionRequested) for ev in emitted)
 
 
-def test_ephemeral_fork_authorized_from_session_artifact_inputs(plugin, monkeypatch):
+def test_ephemeral_fork_authorized_from_session_artifact_inputs(plugin):
     artifact = plugin._build_fork_lifecycle_artifact("ephemeral", parent_session_id="parent-session")
-    monkeypatch.setenv(plugin.SESSION_INPUTS_ENV, json.dumps([serialize_artifact(artifact)]))
 
     child = make_state("child-session")
-    child._session_kind = "fork"
-    child._parent_session_id = "parent-session"
+    session_state(child).kind = "fork"
+    session_state(child).parent_session_id = "parent-session"
+    child._azo_session_inputs = (artifact,)
     assert plugin._latest_fork_lifecycle(child) == "ephemeral"
     assert plugin.suspend_session.available(child) is True
 
     # Mismatched parent lineage rejects the inherited artifact.
     unrelated = make_state("other-child")
-    unrelated._session_kind = "fork"
-    unrelated._parent_session_id = "different-parent"
+    session_state(unrelated).kind = "fork"
+    session_state(unrelated).parent_session_id = "different-parent"
+    unrelated._azo_session_inputs = (artifact,)
     assert plugin._latest_fork_lifecycle(unrelated) == ""
     assert plugin.suspend_session.available(unrelated) is False
 
     # Root sessions ignore fork_lifecycle artifacts.
     root = make_state("root-session")
-    root._session_kind = "default"
+    session_state(root).kind = "default"
+    root._azo_session_inputs = (artifact,)
     assert plugin._latest_fork_lifecycle(root) == ""
     assert plugin.suspend_session.available(root) is False
 
@@ -462,27 +513,29 @@ def test_latest_fork_lifecycle_overrides_cloned_ancestor(plugin):
 
 def test_suspend_session_is_unavailable_to_persistent_fork(plugin):
     state = make_state("persistent-child")
-    state._session_kind = "fork"
+    session_state(state).kind = "fork"
     state.last_tool_calls = []
 
     tc = call_tool(plugin.suspend_session, state)
 
     assert tc.error is True
     assert "not currently available" in (tc.result or "")
-    assert not hasattr(state, plugin.SUSPEND_CONFIRM_ATTR)
+    assert plugin._event_durable(state).suspend_confirmation_pending is False
     assert state.done is False
 
 
-def test_suspend_session_requires_adjacent_confirmation(plugin):
+def test_suspend_session_requires_adjacent_confirmation_and_defers_to_turn_settled(plugin):
     state = make_state("ephemeral-child")
     authorize_ephemeral_fork(plugin, state)
     state.last_tool_calls = []
+    hook = plugin.EphemeralSuspendHook()
 
     first = call_tool(plugin.suspend_session, state)
 
     assert first.error is False
     assert first.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
-    assert state.azo_event_suspend_confirmation_pending is True
+    assert plugin._event_durable(state).suspend_confirmation_pending is True
+    assert plugin._event_runtime(state).pending_suspend is False
     assert state.done is False
     assert not any(isinstance(ev, SuspendRequested) for ev in state._emitted)
 
@@ -491,14 +544,23 @@ def test_suspend_session_requires_adjacent_confirmation(plugin):
 
     assert second.error is False
     assert "suspension confirmed" in (second.result or "")
-    assert state.azo_event_suspend_confirmation_pending is False
+    assert plugin._event_durable(state).suspend_confirmation_pending is False
+    # Tool MUST NOT mutate state.done or emit SuspendRequested mid-RunToolCall!
+    assert plugin._event_runtime(state).pending_suspend is True
+    assert state.done is False
+    assert not any(isinstance(ev, SuspendRequested) for ev in state._emitted)
+
+    # On TurnSettled, EphemeralSuspendHook emits SuspendRequested cleanly.
+    hook_emitted = []
+    hook.handle(TurnSettled(), state, hook_emitted.append)
+    assert plugin._event_runtime(state).pending_suspend is False
     assert state.done is True
     assert state.shutdown is True
     assert state.shutdown_reason == "suspend"
     assert state.shutdown_save is True
     assert state.shutdown_registry_status == "stopped"
     assert state.shutdown_spawned_policy == "leave"
-    suspends = [ev for ev in state._emitted if isinstance(ev, SuspendRequested)]
+    suspends = [ev for ev in hook_emitted if isinstance(ev, SuspendRequested)]
     assert len(suspends) == 1
     assert suspends[0].reason == "ephemeral fork completed"
     assert suspends[0].spawned_policy == "leave"
@@ -523,7 +585,7 @@ def test_suspend_session_confirmation_resets_after_other_tool(plugin):
 
     assert first.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
     assert retry.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
-    assert state.azo_event_suspend_confirmation_pending is True
+    assert plugin._event_durable(state).suspend_confirmation_pending is True
     assert state.done is False
 
 
@@ -550,20 +612,19 @@ def test_suspend_session_rejects_confirmation_bundled_with_other_tool(plugin):
                     parsed_args={},
                 ),
             ]
-        )
+        ),
     ]
 
     retry = call_tool(plugin.suspend_session, state)
 
     assert retry.result == plugin.SUSPEND_CONFIRMATION_MESSAGE
-    assert state.azo_event_suspend_confirmation_pending is True
+    assert plugin._event_durable(state).suspend_confirmation_pending is True
     assert state.done is False
 
 
 def test_owned_subscriptions_are_session_local_and_non_destructive(plugin):
     state = make_state("child-session")
-    state._session_id = "stale-parent-session"
-    state.azo_event_subscriptions = {
+    plugin._event_durable(state).subscriptions = {
         "parent": {
             "id": "parent",
             "name": "parent-only",
@@ -584,8 +645,8 @@ def test_owned_subscriptions_are_session_local_and_non_destructive(plugin):
 
     assert session_id == "child-session"
     assert set(owned) == {"child"}
-    assert set(state.azo_event_subscriptions) == {"parent", "child"}
-    assert state.azo_event_subscriptions["parent"]["runtime"] == {"runs": 3}
+    assert set(plugin._event_durable(state).subscriptions) == {"parent", "child"}
+    assert plugin._event_durable(state).subscriptions["parent"]["runtime"] == {"runs": 3}
 
 
 def test_change_trigger_establishes_baseline_then_fires(plugin):
@@ -638,10 +699,8 @@ def test_rising_trigger_rearms_after_nonmatch(plugin):
     assert plugin._evaluate_observation(spec, matched(3.0)) is not None
 
 
-def test_subscribe_list_and_remove_tool_lifecycle(plugin, monkeypatch, tmp_path):
-    state = make_state("owner-session")
-    sync_calls = []
-    monkeypatch.setattr(plugin._REACTOR, "sync", lambda session_id, specs: sync_calls.append((session_id, dict(specs))))
+def test_subscribe_list_and_remove_tool_lifecycle(plugin, tmp_path):
+    state = make_state("owner-session", cwd=str(tmp_path))
 
     created = call_tool(
         plugin.subscribe_interrupt,
@@ -659,14 +718,21 @@ def test_subscribe_list_and_remove_tool_lifecycle(plugin, monkeypatch, tmp_path)
     )
 
     assert created.error is False
-    subscriptions = state.azo_event_subscriptions
+    subscriptions = plugin._event_durable(state).subscriptions
     assert len(subscriptions) == 1
     subscription_id, spec = next(iter(subscriptions.items()))
     assert subscription_id.startswith("watch_")
     assert spec["owner_session_id"] == "owner-session"
     assert spec["interval_seconds"] == plugin.MIN_INTERVAL_SECONDS
-    assert spec["cwd"] == str(tmp_path.resolve())
-    assert sync_calls[-1][0] == "owner-session"
+    assert spec["cwd"] == str(tmp_path)
+
+    sync_effects = [
+        eff.request for eff in state.io.take_outbox()
+        if isinstance(eff, SubmitOp) and isinstance(eff.request, plugin.SyncCommandWatches)
+    ]
+    assert len(sync_effects) == 1
+    assert sync_effects[0].session_id == "owner-session"
+    assert subscription_id in sync_effects[0].subscriptions
 
     listed = call_tool(plugin.list_interrupt_subscriptions, state)
     assert listed.error is False
@@ -675,12 +741,32 @@ def test_subscribe_list_and_remove_tool_lifecycle(plugin, monkeypatch, tmp_path)
 
     removed = call_tool(plugin.remove_interrupt_subscription, state, subscription="new-prs")
     assert removed.error is False
-    assert subscription_id not in state.azo_event_subscriptions
+    assert subscription_id not in plugin._event_durable(state).subscriptions
+    remove_syncs = [
+        eff.request for eff in state.io.take_outbox()
+        if isinstance(eff, SubmitOp) and isinstance(eff.request, plugin.SyncCommandWatches)
+    ]
+    assert len(remove_syncs) == 1
+    assert remove_syncs[0].subscriptions == {}
 
 
-def test_subscribe_rejects_invalid_regex(plugin, monkeypatch):
+def test_subscribe_rejects_non_directory_via_fs_stat(plugin, tmp_path):
+    state = make_state("owner-session", cwd=str(tmp_path))
+    tc = call_tool(
+        plugin.subscribe_interrupt,
+        state,
+        name="bad-cwd",
+        command="true",
+        match_regex=".*",
+        cwd=str(tmp_path / "missing"),
+        stat_result=FsStatResult(path=str(tmp_path / "missing"), exists=False, is_dir=False),
+    )
+    assert tc.error is True
+    assert "cwd is not a directory" in (tc.result or "")
+
+
+def test_subscribe_rejects_invalid_regex(plugin):
     state = make_state()
-    monkeypatch.setattr(plugin._REACTOR, "sync", lambda *_args, **_kwargs: None)
 
     tc = call_tool(
         plugin.subscribe_interrupt,
@@ -692,30 +778,12 @@ def test_subscribe_rejects_invalid_regex(plugin, monkeypatch):
 
     assert tc.error is True
     assert "invalid match_regex" in tc.result
-
-
-class FakeReactor:
-    def __init__(self, observations, generation=3):
-        self.observations = list(observations)
-        self.synced = []
-        self.cleaned = False
-        self.current_generation = generation
-
-    def sync(self, session_id, specs):
-        self.synced.append((session_id, dict(specs)))
-
-    def drain(self):
-        observations = self.observations
-        self.observations = []
-        return observations
-
-    def cleanup(self):
-        self.cleaned = True
+    assert state.io.take_outbox() == []
 
 
 def test_interrupt_check_discards_stale_revision_and_fires_current(plugin):
     state = make_state("session-a")
-    state.azo_event_subscriptions = {
+    plugin._event_durable(state).subscriptions = {
         "watch-1": {
             "id": "watch-1",
             "name": "ready",
@@ -730,36 +798,52 @@ def test_interrupt_check_discards_stale_revision_and_fires_current(plugin):
             "runtime": {},
         }
     }
-    reactor = FakeReactor(
-        [
-            plugin.CommandObservation(
-                "watch-1", "current", 1.0, stdout="READY", returncode=0,
-                session_id="session-a", generation=2,
-            ),
-            plugin.CommandObservation(
-                "watch-1", "current", 2.0, stdout="READY", returncode=0,
-                session_id="other-session", generation=3,
-            ),
-            plugin.CommandObservation(
-                "watch-1", "stale", 3.0, stdout="READY", returncode=0,
-                session_id="session-a", generation=3,
-            ),
-            plugin.CommandObservation(
-                "watch-1", "current", 4.0, stdout="READY", returncode=0,
-                session_id="session-a", generation=3,
-            ),
-        ]
+    check = plugin.CommandWatchCheck()
+
+    # TurnSettled submits SyncCommandWatches; IoCompleted sets driver_generation=3.
+    check.handle(TurnSettled(), state, lambda _ev: None)
+    outbox = state.io.take_outbox()
+    assert len(outbox) == 1
+    assert isinstance(outbox[0].request, plugin.SyncCommandWatches)
+    assert outbox[0].request.session_id == "session-a"
+    check.handle(
+        IoCompleted(op_id=outbox[0].op_id, value={"generation": 3, "session_id": "session-a"}),
+        state,
+        lambda _ev: None,
     )
 
-    check = plugin.CommandWatchCheck(reactor)
-    check.handle(TurnSettled(), state, lambda _ev: None)
+    # Stale generation, wrong session, stale revision are all discarded; current fires.
+    observations = [
+        plugin.CommandObservation("watch-1", "current", 1.0, stdout="READY", returncode=0, session_id="session-a", generation=2),
+        plugin.CommandObservation("watch-1", "current", 2.0, stdout="READY", returncode=0, session_id="other-session", generation=3),
+        plugin.CommandObservation("watch-1", "stale", 3.0, stdout="READY", returncode=0, session_id="session-a", generation=3),
+        plugin.CommandObservation("watch-1", "current", 4.0, stdout="READY", returncode=0, session_id="session-a", generation=3),
+    ]
+    for obs in observations:
+        check.handle(
+            plugin.CommandWatchTriggered(observation=obs, generation=obs.generation),
+            state,
+            lambda _ev: None,
+        )
 
-    assert reactor.synced[-1][0] == "session-a"
     assert len(state.pending_interrupts) == 1
     assert "READY" in state.pending_interrupts[0]
 
+    # SessionRestored clears ephemeral fork ops and re-syncs watches.
+    plugin._event_runtime(state).fork_ops["stale-op"] = {"stage": "fork_checkpoint"}
+    check.handle(SessionRestored(), state, lambda _ev: None)
+    assert plugin._event_runtime(state).fork_ops == {}
+    restore_outbox = state.io.take_outbox()
+    assert len(restore_outbox) == 1
+    assert isinstance(restore_outbox[0].request, plugin.SyncCommandWatches)
+    assert restore_outbox[0].request.cleanup is False
+
+    # ShutdownRequested submits cleanup sync.
     check.handle(ShutdownRequested(), state, lambda _ev: None)
-    assert reactor.cleaned is True
+    shutdown_outbox = state.io.take_outbox()
+    assert len(shutdown_outbox) == 1
+    assert isinstance(shutdown_outbox[0].request, plugin.SyncCommandWatches)
+    assert shutdown_outbox[0].request.cleanup is True
 
 
 def test_execute_command_captures_bounded_tail(plugin, tmp_path):
@@ -834,12 +918,13 @@ def registration_session(
     parent_session_id: str = "",
 ):
     state = make_state(session_id)
-    state._session_kind = kind
-    state._parent_session_id = parent_session_id
+    smeta = session_state(state)
+    smeta.kind = kind
+    smeta.parent_session_id = parent_session_id
     return SimpleNamespace(state=state)
 
 
-def test_register_features_is_disabled_by_default(plugin, monkeypatch):
+def test_register_features_is_disabled_by_default_and_does_not_mutate_env(plugin, monkeypatch):
     builder = Builder()
     monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "unrelated-parent")
 
@@ -850,7 +935,7 @@ def test_register_features_is_disabled_by_default(plugin, monkeypatch):
     )
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
-    assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
+    assert plugin.os.environ.get(plugin.FORK_ENABLE_ENV) == "unrelated-parent"
 
 
 def test_installed_config_enables_tools_in_fresh_session(plugin, monkeypatch, tmp_path):
@@ -907,7 +992,7 @@ def test_explicit_config_overrides_installed_config(plugin, monkeypatch, tmp_pat
     assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
 
 
-def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
+def test_register_features_adds_tools_driver_and_durable_spec_when_enabled(plugin, monkeypatch):
     builder = Builder()
     monkeypatch.delenv(plugin.FORK_ENABLE_ENV, raising=False)
     plugin.register_features(
@@ -916,9 +1001,13 @@ def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
         config={"event_architecture": {"enabled": True}},
     )
 
-    assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "root-session"
+    # Does NOT mutate process environment.
+    assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
     assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
-    components = builder.features[1].components
+    feature = builder.features[1]
+    assert feature.drivers == [plugin.CommandWatchDriver]
+    assert feature.durable_state == plugin.EVENT_ARCHITECTURE_DURABLE_SPEC
+    components = feature.components
     tool_names = {component.name for component in components if hasattr(component, "name")}
     assert {
         "fork_agent",
@@ -928,6 +1017,7 @@ def test_register_features_adds_tools_when_enabled(plugin, monkeypatch):
     }.issubset(tool_names)
     assert any(isinstance(component, plugin.ForkSessionCoordinator) for component in components)
     assert any(isinstance(component, plugin.CommandWatchCheck) for component in components)
+    assert any(isinstance(component, plugin.EphemeralSuspendHook) for component in components)
 
 
 def test_ephemeral_fork_registration_adds_suspend_tool(plugin, monkeypatch):
@@ -1016,7 +1106,7 @@ def test_suspend_tool_becomes_available_after_fork_state_is_restored(plugin, mon
     assert session.state.tool_schemas["suspend_session"]["available"] is True
 
 
-def test_fork_session_inherits_and_rotates_launch_enablement(plugin, monkeypatch):
+def test_fork_session_inherits_launch_enablement_without_mutating_env(plugin, monkeypatch):
     builder = Builder()
     monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent-session")
     session = registration_session(
@@ -1028,7 +1118,7 @@ def test_fork_session_inherits_and_rotates_launch_enablement(plugin, monkeypatch
     plugin.register_features(builder, session=session, config={})
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings", "event_architecture"]
-    assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "child-session"
+    assert plugin.os.environ[plugin.FORK_ENABLE_ENV] == "parent-session"
 
 
 def test_fork_session_rejects_other_lineage_marker(plugin, monkeypatch):
@@ -1043,7 +1133,6 @@ def test_fork_session_rejects_other_lineage_marker(plugin, monkeypatch):
     plugin.register_features(builder, session=session, config={})
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
-    assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
 
 
 def test_explicit_false_disables_fork_inheritance(plugin, monkeypatch):
@@ -1062,46 +1151,11 @@ def test_explicit_false_disables_fork_inheritance(plugin, monkeypatch):
     )
 
     assert [feature.name for feature in builder.features] == ["event_architecture_settings"]
-    assert plugin.FORK_ENABLE_ENV not in plugin.os.environ
 
 
-def test_fork_enablement_propagates_through_child_process(plugin, monkeypatch):
-    monkeypatch.setenv(plugin.FORK_ENABLE_ENV, "parent-session")
-    code = f"""
-import importlib.util
-import os
-from types import SimpleNamespace
-spec = importlib.util.spec_from_file_location('event_architecture_child', {str(PLUGIN_PATH)!r})
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-class Builder:
-    def __init__(self): self.features = []
-    def add(self, feature): self.features.append(feature)
-state = SimpleNamespace(
-    run_db=SimpleNamespace(session_id='child-session'),
-    _session_id='child-session',
-    _session_kind='fork',
-    _parent_session_id='parent-session',
-)
-builder = Builder()
-module.register_features(builder, session=SimpleNamespace(state=state), config={{}})
-print(','.join(feature.name for feature in builder.features))
-print(os.environ.get(module.FORK_ENABLE_ENV, ''))
-"""
-
-    completed = subprocess.run(
-        [sys.executable, "-P", "-c", code],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.stdout.splitlines() == ["event_architecture_settings,event_architecture", "child-session"]
-
-
-def test_real_reactor_scheduler_delivers_interrupt(plugin, tmp_path):
-    state = make_state("session-live")
-    state.azo_event_subscriptions = {
+def test_command_watch_driver_pushes_events_and_delivers_interrupt(plugin, tmp_path):
+    state = make_state("session-live", cwd=str(tmp_path))
+    plugin._event_durable(state).subscriptions = {
         "watch-live": {
             "id": "watch-live",
             "name": "live-ready",
@@ -1121,18 +1175,41 @@ def test_real_reactor_scheduler_delivers_interrupt(plugin, tmp_path):
             "runtime": {},
         }
     }
-    reactor = plugin.CommandWatchReactor()
-    check = plugin.CommandWatchCheck(reactor)
-    deadline = time.monotonic() + 3.0
+    driver = plugin.CommandWatchDriver()
+    assert driver.durability == "process_bound"
+    assert driver.request_types == (plugin.SyncCommandWatches,)
+    check = plugin.CommandWatchCheck()
 
-    while time.monotonic() < deadline and not state.pending_interrupts:
+    pushed_events = []
+    lock = threading.Lock()
+
+    def _emit(ev):
+        with lock:
+            pushed_events.append(ev)
+
+    driver.start(_emit)
+    try:
         check.handle(TurnSettled(), state, lambda _ev: None)
-        time.sleep(0.02)
+        outbox = state.io.take_outbox()
+        assert len(outbox) == 1
+        driver.submit(outbox[0].op_id, outbox[0].request)
 
-    reactor.cleanup()
-    assert state.pending_interrupts
-    assert "live-ready" in state.pending_interrupts[0]
-    assert "READY" in state.pending_interrupts[0]
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not state.pending_interrupts:
+            with lock:
+                batch = list(pushed_events)
+                pushed_events.clear()
+            for ev in batch:
+                check.handle(ev, state, lambda _ev: None)
+            if not state.pending_interrupts:
+                time.sleep(0.02)
+
+        assert state.pending_interrupts
+        assert "live-ready" in state.pending_interrupts[0]
+        assert "READY" in state.pending_interrupts[0]
+        assert driver.quiesce(policy="terminate") == []
+    finally:
+        driver.close()
 
 
 def test_reactor_completion_queue_is_bounded(plugin):

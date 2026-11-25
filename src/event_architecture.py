@@ -2,27 +2,44 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+from pathlib import Path
 import queue
 import re
 import signal
-import stat
 import subprocess
-import tempfile
 import threading
 import time
-import uuid
-from pathlib import Path
 from typing import Any
+import uuid
 
-from agent_utils.core.events import Event, IoCompleted, IoFailed, RunToolCall, TurnSettled
+from agent_utils.core.events import (
+    Event,
+    IoCompleted,
+    IoFailed,
+    SessionRestored,
+    TurnSettled,
+)
+from agent_utils.core.io import FsStat, IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
-from agent_utils.core.state import State
+from agent_utils.core.state import DurableSpec, State
 from agent_utils.core.tool import Tool, tool
+from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
 from agent_utils.features.interrupts import InterruptCheck
+from agent_utils.runtime.driver import Driver
+from agent_zoo.core.feature_state import session_state
+from agent_zoo.durability import (
+    PluginConfigStore,
+    PluginStorage,
+    StoreUpdate,
+    file_lock,
+)
 from agent_zoo.events import (
     EmitNotice,
     ForkSessionOp,
@@ -39,18 +56,16 @@ from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.turn import build_checkpoint_document
 
 
-STATE_ATTR = "azo_event_subscriptions"
-REACTOR_STATE_ATTR = "azo_event_reactor_runtime"
-SUSPEND_CONFIRM_ATTR = "azo_event_suspend_confirmation_pending"
-FORK_OPS_ATTR = "_azo_event_fork_ops"
+DURABLE_STATE_KEY = "event_architecture"
+RUNTIME_STATE_KEY = "event_architecture"
 FORK_ARTIFACT_NAME = "fork_lifecycle"
-SESSION_INPUTS_ENV = "AZO_SESSION_INPUTS"
 FORK_ENABLE_ENV = "AZO_EVENT_ARCHITECTURE_FORK_ENABLED"
 CONFIG_PATH_ENV = "AZO_EVENT_ARCHITECTURE_CONFIG"
 PLUGIN_NAME = "azo-plugin-event-architecture"
 CONFIG_FILENAME = "event_architecture.json"
-PERSISTENT_FORK_MARKER = "<azo-event-architecture fork-lifecycle=\"persistent\">"
-EPHEMERAL_FORK_MARKER = "<azo-event-architecture fork-lifecycle=\"ephemeral\">"
+CONFIG_REL_PATH = f"config/{CONFIG_FILENAME}"
+PERSISTENT_FORK_MARKER = '<azo-event-architecture fork-lifecycle="persistent">'
+EPHEMERAL_FORK_MARKER = '<azo-event-architecture fork-lifecycle="ephemeral">'
 PERSISTENT_FORK_GUIDANCE = (
     "This is a persistent, long-running fork. Remain available for future work and "
     "handle tasks as they arrive; use RLMs for bounded sub-tasks as useful."
@@ -70,18 +85,67 @@ SUSPEND_CONFIRMATION_MESSAGE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Durable & Ephemeral Per-Session State
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EventArchitectureState:
+    """Durable per-session state for event subscriptions and fork confirmation."""
+
+    subscriptions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    suspend_confirmation_pending: bool = False
+    fork_lifecycle: str = ""
+
+
+@dataclass
+class EventArchitectureRuntime:
+    """Strictly ephemeral per-session runtime state (never serialized)."""
+
+    fork_ops: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_suspend: bool = False
+    driver_generation: int = 0
+    last_synced_signature: Any = None
+    sync_op_ids: set[str] = field(default_factory=set)
+
+
+EVENT_ARCHITECTURE_DURABLE_SPEC = DurableSpec(
+    name=DURABLE_STATE_KEY,
+    cls=EventArchitectureState,
+    version=1,
+    on_fork="reset",
+)
+
+
+def _event_durable(state: Any) -> EventArchitectureState:
+    return state.durable(EVENT_ARCHITECTURE_DURABLE_SPEC)
+
+
+def _event_runtime(state: Any) -> EventArchitectureRuntime:
+    return state.runtime(RUNTIME_STATE_KEY, EventArchitectureRuntime)
+
+
 def _get_session_cwd(state: Any) -> str:
-    cwd = str(
+    return str(
         getattr(state, "cwd", "")
         or getattr(state, "session_cwd", "")
         or getattr(state, "terminal_cwd", "")
         or ""
     ).strip()
-    return cwd or os.getcwd()
+
+
+def _current_session_id(state: Any) -> str:
+    return str(session_state(state).session_id or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Typed IO Requests, Events & Driver-Private Command Watch Reactor
+# ---------------------------------------------------------------------------
 
 
 class CommandObservation:
-    """Immutable-by-convention result passed from workers to the backend thread."""
+    """Immutable-by-convention result passed from watch workers to the pipeline."""
 
     __slots__ = (
         "subscription_id",
@@ -118,6 +182,23 @@ class CommandObservation:
         self.error = error
 
 
+@dataclass
+class SyncCommandWatches(IoRequest):
+    """Typed Sans-I/O request synchronizing background command watches."""
+
+    session_id: str = ""
+    subscriptions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    cleanup: bool = False
+
+
+@dataclass
+class CommandWatchTriggered(Event):
+    """Event pushed by ``CommandWatchDriver`` when a subscribed command completes."""
+
+    observation: CommandObservation
+    generation: int = 0
+
+
 class _BoundedByteTail:
     """Thread-safe byte tail with a strict in-memory size bound."""
 
@@ -141,12 +222,13 @@ class _BoundedByteTail:
 
 
 class CommandWatchReactor:
-    """Run subscribed commands outside the agent backend thread."""
+    """Driver-private background scheduler running subscribed shell commands."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_observation: Any = None) -> None:
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._stop = threading.Event()
+        self._on_observation = on_observation
         self._events: queue.Queue[CommandObservation] = queue.Queue(maxsize=128)
         self._specs: dict[str, dict[str, Any]] = {}
         self._workers: dict[str, dict[str, Any]] = {}
@@ -155,8 +237,12 @@ class CommandWatchReactor:
         self._generation = 0
         self._thread: threading.Thread | None = None
 
-    def sync(self, session_id: str, specs: dict[str, dict[str, Any]]) -> None:
-        """Replace the reactor snapshot and cancel obsolete command groups."""
+    def set_on_observation(self, callback: Any) -> None:
+        with self._lock:
+            self._on_observation = callback
+
+    def sync(self, session_id: str, specs: dict[str, dict[str, Any]]) -> int:
+        """Replace the reactor snapshot, cancel obsolete command groups, return generation."""
         copied = {
             subscription_id: _reactor_spec(spec)
             for subscription_id, spec in specs.items()
@@ -195,14 +281,16 @@ class CommandWatchReactor:
                         processes.append(process)
             if copied:
                 self._ensure_thread_locked()
+            generation = self._generation
         if session_changed:
             self._discard_events()
         for process in processes:
             _terminate_process_group(process)
         self._wake.set()
+        return generation
 
     def drain(self) -> list[CommandObservation]:
-        """Return all completed observations without blocking."""
+        """Return all buffered observations without blocking."""
         observations: list[CommandObservation] = []
         while True:
             try:
@@ -243,6 +331,7 @@ class CommandWatchReactor:
         if scheduler_thread is not None and scheduler_thread is not threading.current_thread():
             scheduler_thread.join()
         with self._lock:
+            self._thread = None
             worker_threads = [
                 worker.get("thread")
                 for worker in self._workers.values()
@@ -252,14 +341,6 @@ class CommandWatchReactor:
             if worker_thread is not threading.current_thread():
                 worker_thread.join()
         self._discard_events()
-
-    def save_state(self) -> dict[str, Any]:
-        """Persist no scheduler, thread, queue, or subprocess state."""
-        return {}
-
-    def restore_state(self, _data: dict[str, Any]) -> None:
-        """Discard live work before subscriptions are synchronized after restore."""
-        self.cleanup()
 
     def _ensure_thread_locked(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -331,6 +412,8 @@ class CommandWatchReactor:
             on_process=lambda process: self._register_process(token, process),
             is_cancelled=lambda: self._worker_cancelled(token),
         )
+        emit_callback = None
+        should_deliver = False
         with self._lock:
             worker = self._workers.pop(token, None)
             current = self._specs.get(subscription_id)
@@ -345,6 +428,13 @@ class CommandWatchReactor:
                 interval = float(current.get("interval_seconds", MIN_INTERVAL_SECONDS))
                 self._next_due[subscription_id] = time.monotonic() + interval
                 self._put_observation(observation)
+                emit_callback = self._on_observation
+                should_deliver = True
+        if should_deliver and callable(emit_callback):
+            try:
+                emit_callback(observation)
+            except Exception:
+                pass
         self._wake.set()
 
     def _worker_value(self, token: str, key: str) -> Any:
@@ -388,6 +478,135 @@ class CommandWatchReactor:
             pass
 
 
+class CommandWatchDriver(Driver):
+    """Process-bound driver owning ``CommandWatchReactor`` and pushing watch events."""
+
+    request_types = (SyncCommandWatches,)
+    durability = "process_bound"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._reactor = CommandWatchReactor(on_observation=self._on_observation)
+        self._cond = threading.Condition(threading.RLock())
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[OpId, Future[Any]] = {}
+        self._cancelled: set[OpId] = set()
+        self._closing = False
+        self._closed = False
+
+    def _ensure_executor_locked(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="azo-command-watch-driver",
+            )
+        return self._executor
+
+    def _on_observation(self, observation: CommandObservation) -> None:
+        with self._cond:
+            if self._closing or self._closed:
+                return
+        self._safe_emit(
+            CommandWatchTriggered(
+                observation=observation,
+                generation=int(observation.generation),
+            )
+        )
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._cond:
+            self._closing = False
+            self._closed = False
+            self._ensure_executor_locked()
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, SyncCommandWatches):
+            raise TypeError(
+                f"CommandWatchDriver expected SyncCommandWatches, got {type(req).__name__}"
+            )
+        with self._cond:
+            if self._closing or self._closed or op_id in self._cancelled:
+                return
+            executor = self._ensure_executor_locked()
+            fut = executor.submit(self._run_sync, op_id, req)
+            self._futures[op_id] = fut
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._cond:
+            self._cancelled.add(op_id)
+            fut = self._futures.get(op_id)
+            if fut is not None and fut.cancel():
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                self._cond.notify_all()
+
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del policy, deadline
+        self._reactor.cleanup()
+        return []
+
+    def close(self) -> None:
+        with self._cond:
+            self._closing = True
+            executor = self._executor
+            for op_id, fut in list(self._futures.items()):
+                self._cancelled.add(op_id)
+                fut.cancel()
+            self._cond.notify_all()
+        self._reactor.cleanup()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        with self._cond:
+            self._closed = True
+            self._executor = None
+            self._futures.clear()
+            self._cancelled.clear()
+            self._cond.notify_all()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._cond:
+            return self._closed or self._closing or op_id in self._cancelled
+
+    def _run_sync(self, op_id: OpId, req: SyncCommandWatches) -> None:
+        if self._is_fenced(op_id):
+            with self._cond:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                self._cond.notify_all()
+            return
+        try:
+            if req.cleanup:
+                self._reactor.cleanup()
+                result = {
+                    "generation": self._reactor.current_generation,
+                    "session_id": "",
+                    "cleaned": True,
+                }
+            else:
+                generation = self._reactor.sync(req.session_id, req.subscriptions)
+                result = {
+                    "generation": generation,
+                    "session_id": req.session_id,
+                    "cleaned": False,
+                }
+            if not self._is_fenced(op_id):
+                self._safe_emit(IoCompleted(op_id=op_id, value=result))
+        except Exception as exc:
+            if not self._is_fenced(op_id):
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
+        finally:
+            with self._cond:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                self._cond.notify_all()
+
+
 def _reactor_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Copy only fields required by background command execution."""
     return {
@@ -397,6 +616,7 @@ def _reactor_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "interval_seconds": float(spec.get("interval_seconds", MIN_INTERVAL_SECONDS)),
         "timeout_seconds": float(spec.get("timeout_seconds", 10.0)),
         "output_limit_bytes": int(spec.get("output_limit_bytes", DEFAULT_OUTPUT_LIMIT_BYTES)),
+        "enabled": bool(spec.get("enabled", True)),
     }
 
 
@@ -558,27 +778,13 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-_REACTOR = CommandWatchReactor()
-
-
-def _current_session_id(state: Any) -> str:
-    run_db = getattr(state, "run_db", None)
-    session_id = str(getattr(run_db, "session_id", "") or "").strip()
-    if session_id:
-        return session_id
-    session_id = str(getattr(state, "_session_id", "") or "").strip()
-    if session_id:
-        return session_id
-    session_io = getattr(state, "session_io", None)
-    return str(getattr(session_io, "session_id", "") or "").strip()
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O Subscription Helpers & InterruptCheck
+# ---------------------------------------------------------------------------
 
 
 def _subscription_store(state: Any) -> dict[str, dict[str, Any]]:
-    store = getattr(state, STATE_ATTR, None)
-    if not isinstance(store, dict):
-        store = {}
-        setattr(state, STATE_ATTR, store)
-    return store
+    return _event_durable(state).subscriptions
 
 
 def _owned_subscriptions(state: Any) -> tuple[str, dict[str, dict[str, Any]]]:
@@ -591,6 +797,55 @@ def _owned_subscriptions(state: Any) -> tuple[str, dict[str, dict[str, Any]]]:
         for subscription_id, spec in _subscription_store(state).items()
         if str(spec.get("owner_session_id") or "") == session_id
     }
+
+
+def _sync_signature(session_id: str, subscriptions: dict[str, dict[str, Any]]) -> Any:
+    return (
+        session_id,
+        tuple(
+            sorted(
+                (sub_id, str(spec.get("revision") or ""), bool(spec.get("enabled", True)))
+                for sub_id, spec in subscriptions.items()
+            )
+        ),
+    )
+
+
+def _submit_watch_sync(
+    state: Any,
+    *,
+    force: bool = False,
+    cleanup: bool = False,
+) -> OpId | None:
+    io_table = getattr(state, "io", None)
+    if io_table is None:
+        return None
+    rt = _event_runtime(state)
+    if cleanup:
+        rt.last_synced_signature = None
+        op_id = io_table.submit(
+            SyncCommandWatches(session_id="", subscriptions={}, cleanup=True),
+            tag="command_watch_sync",
+        )
+        rt.sync_op_ids.add(op_id)
+        return op_id
+
+    session_id, owned = _owned_subscriptions(state)
+    sig = _sync_signature(session_id, owned)
+    if not force and sig == rt.last_synced_signature:
+        return None
+    rt.last_synced_signature = sig
+    specs = {
+        subscription_id: _reactor_spec(spec)
+        for subscription_id, spec in owned.items()
+        if bool(spec.get("enabled", True))
+    }
+    op_id = io_table.submit(
+        SyncCommandWatches(session_id=session_id, subscriptions=specs, cleanup=False),
+        tag="command_watch_sync",
+    )
+    rt.sync_op_ids.add(op_id)
+    return op_id
 
 
 def _find_subscription(
@@ -642,7 +897,11 @@ def _observation_text(spec: dict[str, Any], observation: CommandObservation) -> 
     if source == "stderr":
         return observation.stderr
     if source == "both":
-        return observation.stdout + ("\n" if observation.stdout and observation.stderr else "") + observation.stderr
+        return (
+            observation.stdout
+            + ("\n" if observation.stdout and observation.stderr else "")
+            + observation.stderr
+        )
     return observation.stdout
 
 
@@ -738,47 +997,78 @@ def _format_error_interrupt(
 
 
 class CommandWatchCheck(InterruptCheck):
-    """Synchronize subscriptions and deliver matching command observations."""
+    """Pure Sans-I/O watch coordinator synchronizing via ``SyncCommandWatches``."""
 
     check_name = "command_watch_subscriptions"
     cooldown = 0
-    handles = (TurnSettled, ShutdownRequested)
-    optional_reads = {STATE_ATTR, REACTOR_STATE_ATTR, "run_db", "_session_id", "session_io"}
-    writes = {STATE_ATTR, REACTOR_STATE_ATTR}
-
-    def __init__(self, reactor: CommandWatchReactor):
-        self.reactor = reactor
-        self.init = {STATE_ATTR: dict, REACTOR_STATE_ATTR: lambda: reactor}
+    handles = (
+        SessionRestored,
+        CommandWatchTriggered,
+        TurnSettled,
+        ShutdownRequested,
+        IoCompleted,
+        IoFailed,
+    )
+    optional_reads = set()
+    writes = set()
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del emit
         if isinstance(event, ShutdownRequested):
-            self.reactor.cleanup()
+            _submit_watch_sync(state, cleanup=True)
             return
-        if not isinstance(event, TurnSettled):
-            return
-        setattr(state, REACTOR_STATE_ATTR, self.reactor)
-        session_id, subscriptions = _owned_subscriptions(state)
-        self.reactor.sync(session_id, subscriptions)
-        current_generation = int(getattr(self.reactor, "current_generation", 0))
 
-        for observation in self.reactor.drain():
-            if current_generation and observation.generation != current_generation:
-                continue
+        if isinstance(event, SessionRestored):
+            rt = _event_runtime(state)
+            rt.fork_ops.clear()
+            rt.pending_suspend = False
+            rt.sync_op_ids.clear()
+            rt.last_synced_signature = None
+            _submit_watch_sync(state, force=True)
+            return
+
+        if isinstance(event, (IoCompleted, IoFailed)):
+            rt = _event_runtime(state)
+            if event.op_id not in rt.sync_op_ids:
+                return
+            rt.sync_op_ids.discard(event.op_id)
+            if isinstance(event, IoCompleted) and isinstance(event.value, dict):
+                gen = int(event.value.get("generation") or 0)
+                if gen > rt.driver_generation:
+                    rt.driver_generation = gen
+            return
+
+        if isinstance(event, TurnSettled):
+            _submit_watch_sync(state, force=False)
+            return
+
+        if isinstance(event, CommandWatchTriggered):
+            observation = event.observation
+            rt = _event_runtime(state)
+            obs_gen = int(event.generation or observation.generation or 0)
+            if rt.driver_generation and obs_gen and obs_gen < rt.driver_generation:
+                return
+            session_id, subscriptions = _owned_subscriptions(state)
             if observation.session_id and observation.session_id != session_id:
-                continue
+                return
             spec = subscriptions.get(observation.subscription_id)
             if spec is None:
-                continue
+                return
             if str(spec.get("revision") or "") != observation.revision:
-                continue
+                return
             message = _evaluate_observation(spec, observation)
             if message:
                 self._fire(state, message)
 
-    def status_line(self, state) -> str:
+    def status_line(self, state: Any) -> str:
         session_id, subscriptions = _owned_subscriptions(state)
         enabled = sum(bool(spec.get("enabled", True)) for spec in subscriptions.values())
         return f"  command watches: {enabled} enabled for session {session_id or '(unbound)'}"
+
+
+# ---------------------------------------------------------------------------
+# Fork Lifecycle & Suspension
+# ---------------------------------------------------------------------------
 
 
 def _fork_launch_message(text: str, lifecycle: str) -> str:
@@ -804,18 +1094,14 @@ def _content_texts(content: Any) -> list[str]:
 
 
 def _fork_lifecycle_from_session_inputs(state: Any) -> str:
-    if str(getattr(state, "_session_kind", "") or "").strip().lower() != "fork":
+    smeta = session_state(state)
+    if str(smeta.kind or "").strip().lower() != "fork":
         return ""
-    parent_session_id = str(getattr(state, "_parent_session_id", "") or "").strip()
+    durable_lifecycle = str(_event_durable(state).fork_lifecycle or "").strip().lower()
+    if durable_lifecycle in VALID_FORK_LIFECYCLES:
+        return durable_lifecycle
+    parent_session_id = str(smeta.parent_session_id or "").strip()
     raw_inputs = getattr(state, "_azo_session_inputs", None)
-    if raw_inputs is None:
-        raw_env = str(os.environ.get(SESSION_INPUTS_ENV, "") or "").strip()
-        if not raw_env:
-            return ""
-        try:
-            raw_inputs = json.loads(raw_env)
-        except json.JSONDecodeError:
-            return ""
     if not isinstance(raw_inputs, (list, tuple)):
         return ""
     lifecycle = ""
@@ -865,11 +1151,7 @@ def _ephemeral_fork_authorized(state: Any) -> bool:
 
 
 def _fork_ops(state: Any) -> dict[str, dict[str, Any]]:
-    ops = getattr(state, FORK_OPS_ATTR, None)
-    if not isinstance(ops, dict):
-        ops = {}
-        setattr(state, FORK_OPS_ATTR, ops)
-    return ops
+    return _event_runtime(state).fork_ops
 
 
 def _build_fork_lifecycle_artifact(
@@ -911,11 +1193,12 @@ def _build_fork_session_spec(
     provenance = cfg.get("_runtime_launch") if isinstance(cfg.get("_runtime_launch"), dict) else {}
     llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
     pilot_cfg = cfg.get("pilot") if isinstance(cfg.get("pilot"), dict) else {}
+    smeta = session_state(state)
 
     project = (
         str(
             context.get("project_name")
-            or getattr(state, "_project_name", "")
+            or smeta.project_name
             or cfg.get("project_name")
             or "default"
         ).strip()
@@ -963,10 +1246,10 @@ def _extract_fork_checkpoint(
         err = str(getattr(receipt, "error", "") or "fork checkpoint was not saved locally")
         return "", "", None, fallback_title, "", err
 
-    def _pick(field: str, fallback: str = "") -> str:
-        raw = value.get(field) if isinstance(value, dict) else getattr(value, field, None)
+    def _pick(field_name: str, fallback: str = "") -> str:
+        raw = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
         if not raw and receipt is not None and receipt is not value:
-            raw = getattr(receipt, field, None)
+            raw = getattr(receipt, field_name, None)
         return str(raw or fallback or "").strip()
 
     child_id = _pick("session_id")
@@ -982,31 +1265,30 @@ def _extract_fork_checkpoint(
 class ForkSessionCoordinator:
     """Coordinate ``ForkSessionOp(spawn_child=False)`` -> ``SpawnSession`` -> ``PublishView(attach=...)``."""
 
-    handles = (IoCompleted, IoFailed)
-    init = {FORK_OPS_ATTR: dict}
+    handles = (IoCompleted, IoFailed, SessionRestored)
     optional_reads = {
-        FORK_OPS_ATTR,
         "config",
         "_agent_zoo_context",
-        "_project_name",
         "_pipeline_key",
         "_persistence_local_root",
         "active_model",
         "cwd",
         "session_cwd",
         "terminal_cwd",
-        "_session_title",
     }
-    writes = {FORK_OPS_ATTR}
+    writes = set()
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config if isinstance(config, dict) else None
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, SessionRestored):
+            _fork_ops(state).clear()
+            return
         if not isinstance(event, (IoCompleted, IoFailed)):
             return
-        ops = getattr(state, FORK_OPS_ATTR, None)
-        if not isinstance(ops, dict) or event.op_id not in ops:
+        ops = _fork_ops(state)
+        if event.op_id not in ops:
             return
         pending = ops.pop(event.op_id)
         stage = str(pending.get("stage") or "")
@@ -1116,10 +1398,7 @@ class ForkSessionCoordinator:
         emit(ProjectionRequested())
 
 
-@tool(
-    optional_reads={"session_io", "run_db", "_session_id", "_session_title", FORK_OPS_ATTR},
-    writes={FORK_OPS_ATTR},
-)
+@tool()
 def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
     """Create an independent worker agent that can respond to future events.
 
@@ -1145,11 +1424,8 @@ def fork_agent(message: str, lifecycle: str = "persistent", state=None) -> str:
         raise RuntimeError("fork_agent requires a bound live session ID")
 
     launch_message = _fork_launch_message(text, normalized_lifecycle)
-    title = str(getattr(state, "_session_title", "") or "")
+    title = str(session_state(state).title or "")
     source_doc = build_checkpoint_document(state)
-    attrs = source_doc.get("attrs")
-    if isinstance(attrs, dict):
-        attrs.pop(FORK_OPS_ATTR, None)
 
     op_id = state.io.submit(
         ForkSessionOp(
@@ -1180,23 +1456,15 @@ class SuspendSession(Tool):
     """Ephemeral-fork-only graceful suspension tool."""
 
     name = "suspend_session"
-    optional_reads = {"entries", "last_tool_calls", "session_io", SUSPEND_CONFIRM_ATTR}
-    writes = {
-        SUSPEND_CONFIRM_ATTR,
-        "done",
-        "shutdown_reason",
-        "shutdown_save",
-        "shutdown_registry_status",
-        "shutdown_spawned_policy",
-        "shutdown",
-    }
-    init = {SUSPEND_CONFIRM_ATTR: bool}
+    optional_reads = {"entries", "last_tool_calls"}
+    writes = set()
 
     def available(self, state: State) -> bool:
         return _ephemeral_fork_authorized(state)
 
     def call(self, state: State) -> str:
         """Suspend this ephemeral fork after a required two-call confirmation."""
+        durable = _event_durable(state)
         previous_calls = list(getattr(state, "last_tool_calls", []) or [])
         previous_was_confirmation = (
             len(previous_calls) == 1
@@ -1213,50 +1481,67 @@ class SuspendSession(Tool):
         current_is_only_suspend = (
             len(current_calls) == 1 and current_calls[0].name == "suspend_session"
         )
-        confirmation_pending = bool(getattr(state, SUSPEND_CONFIRM_ATTR, False))
         if (
-            not confirmation_pending
+            not durable.suspend_confirmation_pending
             or not previous_was_confirmation
             or not current_is_only_suspend
         ):
-            setattr(state, SUSPEND_CONFIRM_ATTR, True)
+            durable.suspend_confirmation_pending = True
             return SUSPEND_CONFIRMATION_MESSAGE
 
-        setattr(state, SUSPEND_CONFIRM_ATTR, False)
+        durable.suspend_confirmation_pending = False
         if state is None or getattr(state, "io", None) is None:
             raise RuntimeError("suspend_session requires a live Agent Zoo session")
+        _event_runtime(state).pending_suspend = True
+        return "Ephemeral fork suspension confirmed; saving and suspending this session."
+
+
+class EphemeralSuspendHook:
+    """Emit ``SuspendRequested`` on ``TurnSettled`` after ``suspend_session`` consolidates."""
+
+    _singleton = True
+    handles = (TurnSettled,)
+    writes = {
+        "done",
+        "shutdown",
+        "shutdown_reason",
+        "shutdown_save",
+        "shutdown_registry_status",
+        "shutdown_spawned_policy",
+    }
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, TurnSettled):
+            return
+        rt = _event_runtime(state)
+        if not rt.pending_suspend:
+            return
+        rt.pending_suspend = False
         state.done = True
+        state.shutdown = True
         state.shutdown_reason = "suspend"
         state.shutdown_save = True
         state.shutdown_registry_status = "stopped"
         state.shutdown_spawned_policy = "leave"
-        state.shutdown = True
-        return "Ephemeral fork suspension confirmed; saving and suspending this session."
-
-    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        was_shutdown = bool(getattr(state, "shutdown", False))
-        super().handle(event, state, emit)
-        if (
-            isinstance(event, RunToolCall)
-            and event.tool_call.name == self.name
-            and not event.tool_call.error
-            and bool(getattr(state, "shutdown", False))
-            and not was_shutdown
-        ):
-            emit(
-                SuspendRequested(
-                    reason="ephemeral fork completed",
-                    save=True,
-                    spawned_policy="leave",
-                    registry_status="stopped",
-                )
+        emit(
+            SuspendRequested(
+                reason="ephemeral fork completed",
+                save=True,
+                spawned_policy="leave",
+                registry_status="stopped",
             )
+        )
 
 
 suspend_session = SuspendSession()
 
 
-@tool(optional_reads={STATE_ATTR, "run_db", "_session_id", "session_io"}, writes={STATE_ATTR})
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O Watch Subscription Tools
+# ---------------------------------------------------------------------------
+
+
+@tool(optional_reads={"cwd", "session_cwd", "terminal_cwd", "home_dir"})
 def subscribe_interrupt(
     name: str,
     command: str,
@@ -1269,7 +1554,7 @@ def subscribe_interrupt(
     wake_on_error: bool = False,
     cwd: str = "",
     state=None,
-) -> str:
+) -> Iterator[FsStat]:
     """Poll a shell command and wake this session when its output triggers.
 
     Commands run asynchronously under ``/bin/bash -lc``. Polling for a
@@ -1315,13 +1600,15 @@ def subscribe_interrupt(
     if any(str(spec.get("name") or "") == clean_name for spec in subscriptions.values()):
         raise ValueError(f"subscription name already exists: {clean_name}")
 
-    base_cwd = Path(_get_session_cwd(state)).expanduser()
-    resolved_cwd = Path(cwd).expanduser() if str(cwd or "").strip() else base_cwd
-    if not resolved_cwd.is_absolute():
-        resolved_cwd = base_cwd / resolved_cwd
-    resolved_cwd = resolved_cwd.resolve()
-    if not resolved_cwd.is_dir():
+    raw_cwd = str(cwd or "").strip()
+    resolved_cwd = resolve_session_path(raw_cwd, state) if raw_cwd else _get_session_cwd(state)
+    if not resolved_cwd:
+        raise ValueError("cwd is required when session has no working directory")
+
+    stat_result = yield FsStat(resolved_cwd)
+    if not getattr(stat_result, "exists", False) or not getattr(stat_result, "is_dir", False):
         raise ValueError(f"cwd is not a directory: {resolved_cwd}")
+    canonical_cwd = str(getattr(stat_result, "path", "") or resolved_cwd)
 
     subscription_id = f"watch_{uuid.uuid4().hex[:12]}"
     spec = {
@@ -1338,13 +1625,13 @@ def subscribe_interrupt(
         "fire_initial": bool(fire_initial),
         "wake_on_error": bool(wake_on_error),
         "enabled": True,
-        "cwd": str(resolved_cwd),
+        "cwd": canonical_cwd,
         "created_at": time.time(),
         "revision": uuid.uuid4().hex,
         "runtime": {},
     }
     _subscription_store(state)[subscription_id] = spec
-    _REACTOR.sync(session_id, _owned_subscriptions(state)[1])
+    _submit_watch_sync(state, force=True)
     return "Registered command interrupt subscription:\n" + json.dumps(
         {key: value for key, value in spec.items() if key != "runtime"},
         indent=2,
@@ -1352,7 +1639,7 @@ def subscribe_interrupt(
     )
 
 
-@tool(optional_reads={STATE_ATTR, "run_db", "_session_id", "session_io"})
+@tool()
 def list_interrupt_subscriptions(state=None) -> str:
     """List command interrupt subscriptions owned by this session."""
     session_id, subscriptions = _owned_subscriptions(state)
@@ -1378,7 +1665,7 @@ def list_interrupt_subscriptions(state=None) -> str:
     return json.dumps(rows, indent=2, sort_keys=True)
 
 
-@tool(optional_reads={STATE_ATTR, "run_db", "_session_id", "session_io"}, writes={STATE_ATTR})
+@tool()
 def remove_interrupt_subscription(subscription: str, state=None) -> str:
     """Remove one command interrupt subscription by ID or exact name.
 
@@ -1394,40 +1681,38 @@ def remove_interrupt_subscription(subscription: str, state=None) -> str:
         raise ValueError(f"subscription not found for session {session_id}: {query}")
     subscription_id, spec = found
     _subscription_store(state).pop(subscription_id, None)
-    _REACTOR.sync(session_id, _owned_subscriptions(state)[1])
+    _submit_watch_sync(state, force=True)
     return f"Removed subscription {spec.get('name')} ({subscription_id}) from session {session_id}."
 
 
-def _agent_zoo_state_root() -> Path:
-    for env_name in ("AGENT_ZOO_HOME", "AGENT_ZOO_STATE_ROOT", "AGENT_ZOO_INSTALL_ROOT"):
-        value = str(os.environ.get(env_name, "") or "").strip()
-        if value:
-            return Path(value).expanduser()
-    xdg_data = str(os.environ.get("XDG_DATA_HOME", "") or "").strip()
-    base = Path(xdg_data).expanduser() if xdg_data else Path.home() / ".local" / "share"
-    return base / "agent-zoo"
+# ---------------------------------------------------------------------------
+# Host Build-Time Config Loading & Pure Sans-I/O Settings Box
+# ---------------------------------------------------------------------------
 
 
-def _plugin_config_path() -> Path:
-    override = str(os.environ.get(CONFIG_PATH_ENV, "") or "").strip()
-    if override:
-        return Path(override).expanduser()
-    return (
-        _agent_zoo_state_root()
-        / "plugin-configs"
-        / PLUGIN_NAME
-        / "config"
-        / CONFIG_FILENAME
+@dataclass
+class _SettingsBox:
+    """In-memory snapshot of plugin configuration loaded once at host build time."""
+
+    enabled: bool = False
+    has_explicit_enabled: bool = False
+    load_error: str = ""
+    config_filename: str = CONFIG_REL_PATH
+
+
+def _plugin_storage(*, state_root: str | Path | None = None) -> PluginStorage:
+    return PluginStorage(
+        PLUGIN_NAME,
+        state_root=state_root,
+        config_filename=CONFIG_REL_PATH,
     )
 
 
-def _load_installed_config() -> dict[str, Any]:
-    path = _plugin_config_path()
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
+def _plugin_config_store(*, state_root: str | Path | None = None) -> PluginConfigStore:
+    override = str(os.environ.get(CONFIG_PATH_ENV, "") or "").strip()
+    if override:
+        return PluginConfigStore(Path(override).expanduser())
+    return _plugin_storage(state_root=state_root).config
 
 
 def _configured_enablement(config: Any) -> bool | None:
@@ -1444,25 +1729,59 @@ def _configured_enablement(config: Any) -> bool | None:
     return value is True
 
 
-def _effective_configured_enablement(config: Any) -> bool | None:
+def _read_config_strict(store: PluginConfigStore) -> tuple[dict[str, Any], str]:
+    """Read plugin config under cross-process lock without overwriting malformed files."""
+    path = store.path
+    if not path.exists():
+        return {}, ""
+    try:
+        with file_lock(store.lock_path, shared=True):
+            raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return {}, "Cannot read plugin configuration"
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}, "Cannot read plugin configuration"
+    if not isinstance(document, dict):
+        return {}, "Plugin configuration must be an object"
+    if "event_architecture" in document and not isinstance(document["event_architecture"], dict):
+        return {}, "Plugin configuration section must be an object"
+    return document, ""
+
+
+def _load_settings_box(*, state_root: str | Path | None = None) -> _SettingsBox:
+    store = _plugin_config_store(state_root=state_root)
+    document, err = _read_config_strict(store)
+    if err:
+        return _SettingsBox(enabled=False, has_explicit_enabled=False, load_error=err)
+    configured = _configured_enablement(document)
+    return _SettingsBox(
+        enabled=(configured is True),
+        has_explicit_enabled=(configured is not None),
+        load_error="",
+        config_filename=CONFIG_REL_PATH,
+    )
+
+
+def _plugin_enabled(
+    config: Any,
+    session: Any,
+    *,
+    settings_box: _SettingsBox | None = None,
+) -> bool:
     explicit = _configured_enablement(config)
     if explicit is not None:
         return explicit
-    return _configured_enablement(_load_installed_config())
-
-
-def _registration_session_id(session: Any) -> str:
+    box = settings_box if settings_box is not None else _load_settings_box()
+    if box.has_explicit_enabled:
+        return box.enabled
     state = getattr(session, "state", None)
-    return _current_session_id(state) if state is not None else ""
-
-
-def _plugin_enabled(config: Any, session: Any) -> bool:
-    configured = _effective_configured_enablement(config)
-    if configured is not None:
-        return configured
-    state = getattr(session, "state", None)
-    session_kind = str(getattr(state, "_session_kind", "") or "").strip().lower()
-    parent_session_id = str(getattr(state, "_parent_session_id", "") or "").strip()
+    if state is None:
+        return False
+    smeta = session_state(state)
+    session_kind = str(smeta.kind or "").strip().lower()
+    parent_session_id = str(smeta.parent_session_id or "").strip()
     inherited_parent_id = str(os.environ.get(FORK_ENABLE_ENV, "") or "").strip()
     return (
         session_kind == "fork"
@@ -1471,88 +1790,93 @@ def _plugin_enabled(config: Any, session: Any) -> bool:
     )
 
 
-def _settings_document(path: Path) -> dict[str, Any]:
-    """Read strictly so edits never replace malformed configuration."""
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise SettingError("Cannot read plugin configuration") from None
-    if not isinstance(document, dict):
-        raise SettingError("Plugin configuration must be an object")
-    if "event_architecture" in document and not isinstance(document["event_architecture"], dict):
-        raise SettingError("Plugin configuration section must be an object")
-    return document
+def _register_settings(builder: Any, box: _SettingsBox) -> None:
+    def get_enabled(_ctx: Any) -> bool:
+        if box.load_error:
+            raise SettingError(box.load_error)
+        return bool(box.enabled)
 
-
-def _save_enabled(value) -> None:
-    temporary = None
-    try:
-        path = _plugin_config_path().resolve()
-        document = _settings_document(path)
+    def set_enabled(ctx: Any, value: Any) -> None:
+        if box.load_error:
+            raise SettingError(box.load_error)
         if type(value) is not bool:
             raise SettingError("Expected a boolean")
-        document.setdefault("event_architecture", {})["enabled"] = value
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix="." + path.name, delete=False) as stream:
-            temporary = Path(stream.name)
-            os.fchmod(stream.fileno(), mode)
-            stream.write(json.dumps(document, indent=2) + "\n")
-        os.replace(temporary, path)
-    except (OSError, UnicodeError, ValueError) as exc:
-        if isinstance(exc, SettingError):
-            raise
-        raise SettingError("Cannot save plugin configuration") from None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        previous = box.enabled
+        previous_explicit = box.has_explicit_enabled
+        box.enabled = value
+        box.has_explicit_enabled = True
 
+        def _rollback() -> None:
+            box.enabled = previous
+            box.has_explicit_enabled = previous_explicit
 
-def _register_settings(builder) -> None:
-    def get_enabled(ctx):
-        document = _settings_document(_plugin_config_path())
-        return _configured_enablement(document) is True
+        def _updater(current: dict[str, Any]) -> dict[str, Any]:
+            doc = dict(current) if isinstance(current, dict) else {}
+            section = doc.get("event_architecture")
+            if section is not None and not isinstance(section, dict):
+                raise SettingError("Plugin configuration section must be an object")
+            updated_section = dict(section) if isinstance(section, dict) else {}
+            updated_section["enabled"] = value
+            doc["event_architecture"] = updated_section
+            return doc
 
-    builder.add(Feature("event_architecture_settings", components=[
-        Setting("event_architecture.enabled", "Enabled by default", "bool", get_enabled,
-                set=lambda ctx, value: _save_enabled(value),
-                group="Event architecture", apply="reload",
-                help=("Saved default for ordinary sessions, not current fork status. "
-                      "Absent means false here; legacy fork inheritance remains until explicitly saved. "
-                      "Reload to apply; explicit launch configuration may override this default.")),
-    ], order=[Setting]))
+        ctx.submit_persist_io(
+            StoreUpdate(
+                plugin=PLUGIN_NAME,
+                scope="config",
+                config_filename=box.config_filename,
+                updater=_updater,
+            ),
+            rollback=_rollback,
+        )
+
+    builder.add(
+        Feature(
+            "event_architecture_settings",
+            components=[
+                Setting(
+                    "event_architecture.enabled",
+                    "Enabled by default",
+                    "bool",
+                    get_enabled,
+                    set=set_enabled,
+                    group="Event architecture",
+                    apply="reload",
+                    help=(
+                        "Saved default for ordinary sessions, not current fork status. "
+                        "Absent means false here; legacy fork inheritance remains until explicitly saved. "
+                        "Reload to apply; explicit launch configuration may override this default."
+                    ),
+                ),
+            ],
+            order=[Setting],
+        )
+    )
 
 
 def register_features(builder, *, session, config):
     """Register model tools only when explicitly enabled or inherited by a fork."""
-    _register_settings(builder)
-    configured = _effective_configured_enablement(config)
-    enabled = _plugin_enabled(config, session)
-    current_session_id = _registration_session_id(session)
-    if enabled and current_session_id:
-        os.environ[FORK_ENABLE_ENV] = current_session_id
-    elif configured is not None or not enabled:
-        os.environ.pop(FORK_ENABLE_ENV, None)
-    if not enabled:
-        _REACTOR.cleanup()
+    box = _load_settings_box()
+    _register_settings(builder, box)
+    if not _plugin_enabled(config, session, settings_box=box):
         return
 
     components = [
         ForkSessionCoordinator(config),
         fork_agent,
         suspend_session,
+        EphemeralSuspendHook(),
         subscribe_interrupt,
         list_interrupt_subscriptions,
         remove_interrupt_subscription,
-        CommandWatchCheck(_REACTOR),
+        CommandWatchCheck(),
     ]
     builder.add(
         Feature(
             name="event_architecture",
             components=components,
-            order=[IoFence, ForkSessionCoordinator, Tool],
+            order=[IoFence, ForkSessionCoordinator, Tool, {EphemeralSuspendHook, CommandWatchCheck}],
+            drivers=[CommandWatchDriver],
+            durable_state=EVENT_ARCHITECTURE_DURABLE_SPEC,
         )
     )
